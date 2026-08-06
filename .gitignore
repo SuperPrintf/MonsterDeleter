@@ -1,0 +1,10 @@
+# Archived upstream source: retained locally for reference, not part of the rewrite.
+/原始项目文件/
+
+# Reproducible local build output.
+/target/
+/dist/
+
+# One-off visual verification captures.
+/selection-*.png
+/native-overlay-*.png
