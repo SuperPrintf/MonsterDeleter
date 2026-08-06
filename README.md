@@ -23,7 +23,7 @@
 ├─ installer/MonsterDeleter.iss       # Inno Setup：安装、右键注册、卸载
 ├─ build.rs                           # 将怪兽头部图标写入主程序资源
 ├─ build-installer.ps1                # 先编译，再调用 Inno Setup 生成安装包
-├─ releases/windows/x86_64/           # 可直接分发的当前 Windows 安装包
+├─ releases/                          # 发布说明（安装包托管在 GitHub Releases）
 ├─ platforms/                         # 未来 macOS/Linux 的系统集成预留说明
 ├─ .github/workflows/windows-release.yml # 标签构建与 GitHub Actions 制品发布
 └─ 原始项目文件/                       # 仅本地归档，不会提交到仓库
@@ -67,11 +67,11 @@ cargo build --release
 
 脚本会先执行 release 构建，再调用 Inno Setup，输出 `dist\MonsterDeleter-Setup.exe`。安装时选择“为所有用户安装”会触发 UAC；这是写入系统级右键菜单所必需的。
 
-当前可分发版本已纳入仓库：[MonsterDeleter-Setup.exe](releases/windows/x86_64/MonsterDeleter-Setup.exe)。
+当前可分发版本：[下载 MonsterDeleter-Setup.exe](https://github.com/SuperPrintf/MonsterDeleter/releases/latest/download/MonsterDeleter-Setup.exe)。
 
 ## 发布与跨平台规划
 
-`releases/<系统>/<架构>/` 存放经验证、可直接下载的安装包；当前目录中的 Windows x64 安装包是首个基线版本。后续正式版本建议通过 GitHub Release 的附件分发，并以版本标签（如 `v1.1.0`）触发自动构建。仓库中的 GitHub Actions 会保留每次标签构建的安装包制品。
+正式安装包通过 GitHub Releases 的附件分发，而不提交到代码树；当前 Windows x64 基线版本为 `v1.0.4`。每个正式版本以标签（如 `v1.1.0`）标记，仓库中的 GitHub Actions 会保留对应构建的安装包制品。`releases/` 目录仅存放发行约定和说明。
 
 `platforms/windows`、`platforms/linux` 与 `platforms/macos` 预留了各平台入口和打包方式。动画状态机、素材编排和删除策略应逐步下沉为平台无关 Rust 核心；各平台目录仅实现对应的文件管理器菜单、透明覆盖层、权限请求和安装包适配。这样新增平台时不会破坏 Windows 版本的行为。
 
