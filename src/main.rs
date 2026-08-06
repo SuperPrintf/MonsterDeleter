@@ -517,13 +517,13 @@ impl OverlayApp {
                 self.ensure_point();
                 self.enter(Phase::Walk);
             }
-            Phase::Walk if self.elapsed() >= 4.5 => {
-                self.audio.play("monster_talk");
-                self.enter(Phase::Point);
-            }
+            Phase::Walk if self.elapsed() >= 4.5 => self.enter(Phase::Point),
             Phase::Point if self.elapsed() >= 0.5 => {
                 self.ensure_kick_sequence();
                 self.enter(Phase::Ask);
+                // Keep the original talking sound, but synchronize it with the
+                // visible question so it is never lost during the point transition.
+                self.audio.play("monster_talk");
             }
             Phase::Kick => {
                 if self.frame() >= 5 && !self.deletion_started {

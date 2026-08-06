@@ -1,6 +1,6 @@
 [package]
 name = "monster-deleter"
-version = "1.0.0"
+version = "1.0.5"
 edition = "2021"
 description = "A consent-first Windows Recycle Bin helper with a playful monster theme."
 license = "MIT"
