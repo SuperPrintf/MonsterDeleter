@@ -1,5 +1,7 @@
 # MonsterDeleter（小怪兽删除器）
 
+> **下载发行版：** [MonsterDeleter-Setup.exe（Windows x64）](https://github.com/SuperPrintf/MonsterDeleter/releases/latest/download/MonsterDeleter-Setup.exe)
+
 一个面向 Windows 桌面的趣味删除工具：在资源管理器中右键选择文件或文件夹，召唤小怪兽执行删除。它保留了原项目的动画、问答按钮与音效体验，并以 Rust 和原生 Win32 窗口重构。
 
 > 当前仅支持 Windows 10/11 x64。安装包需要管理员权限，以便为所有用户注册资源管理器右键菜单。
@@ -66,8 +68,6 @@ cargo build --release
 ```
 
 脚本会先执行 release 构建，再调用 Inno Setup，输出 `dist\MonsterDeleter-Setup.exe`。安装时选择“为所有用户安装”会触发 UAC；这是写入系统级右键菜单所必需的。
-
-当前可分发版本：[下载 MonsterDeleter-Setup.exe](https://github.com/SuperPrintf/MonsterDeleter/releases/latest/download/MonsterDeleter-Setup.exe)。
 
 ## 发布与跨平台规划
 
