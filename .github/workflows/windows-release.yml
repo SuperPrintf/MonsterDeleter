@@ -1,0 +1,38 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build installer
+        shell: powershell
+        run: .\build-installer.ps1
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonsterDeleter-Setup-windows-x86_64
+          path: dist/MonsterDeleter-Setup.exe
+          if-no-files-found: error
