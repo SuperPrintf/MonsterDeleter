@@ -6,44 +6,62 @@
 
 use std::{
     env,
+    fs,
     os::windows::ffi::OsStrExt,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     ptr::null_mut,
     slice,
+    process::Command,
+    sync::mpsc::{sync_channel, Receiver, TryRecvError},
+    thread,
     time::Instant,
 };
 
 use image::{imageops::FilterType, RgbaImage};
 use windows::{
-    core::{Result, PCWSTR},
+    core::{Interface, Result, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
-            COLORREF, ERROR_ACCESS_DENIED, ERROR_CANCELLED, HWND, LPARAM, LRESULT, POINT, RECT,
-            SIZE, WIN32_ERROR, WPARAM,
+            COLORREF, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_NO_MORE_ITEMS, HWND, LPARAM,
+            LRESULT, POINT, RECT, SIZE, WIN32_ERROR, WPARAM,
         },
         Graphics::Gdi::{
             CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC,
             DeleteObject, DrawTextW, GetMonitorInfoW, MonitorFromPoint, SelectObject, SetBkMode,
             SetTextColor, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-            ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-            DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FONT_FAMILY,
+                ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+                DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FONT_FAMILY,
             MONITORINFO,
             MONITOR_DEFAULTTONEAREST, OUT_TT_PRECIS, TRANSPARENT,
         },
         Media::Multimedia::mciSendStringW,
         Storage::FileSystem::GetFileAttributesW,
+        System::{
+            Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                COINIT_APARTMENTTHREADED, IPersistFile, STGM_READ,
+            },
+            Environment::ExpandEnvironmentStringsW,
+            Registry::{
+                RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY,
+                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY,
+                KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+            },
+        },
         UI::{
             HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS},
             Shell::{
-                SHFileOperationW, ShellExecuteW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
-                FO_DELETE, SHFILEOPSTRUCTW,
+                IShellLinkW, SHFileOperationW, ShellExecuteW, ShellLink, FOF_ALLOWUNDO,
+                FOF_NOCONFIRMATION, FOF_NOERRORUI, FO_DELETE, SHFILEOPSTRUCTW,
             },
             WindowsAndMessaging::{
                 CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
-                DispatchMessageW, GetCursorPos, GetMessageW, LoadCursorW, PostQuitMessage,
-                RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                TranslateMessage, IDC_ARROW,
+                DispatchMessageW, GetCursorPos, GetMessageW, LoadCursorW, MessageBoxW,
+                PostQuitMessage, RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW,
+                SetWindowPos, ShowWindow, TranslateMessage, IDC_ARROW, IDYES, MB_ICONWARNING,
+                MB_YESNO,
                 UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR,
                 HWND_TOPMOST, ICONINFO, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOW,
                 SW_SHOWNORMAL, ULW_ALPHA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
@@ -65,6 +83,9 @@ enum Phase {
     Walk,
     Point,
     Ask,
+    DetectUninstall,
+    UninstallAsk,
+    UninstallUnavailable,
     Kick,
     Leo,
     Fly,
@@ -90,6 +111,21 @@ struct Sprite {
     frames: Vec<RgbaImage>,
     width: i32,
     height: i32,
+}
+
+/// An exact registry-backed association between a shortcut target and an
+/// installed desktop application. We deliberately retain only the uninstall
+/// command published by Windows' installed-program registry entry.
+#[derive(Clone)]
+struct InstalledApp {
+    display_name: String,
+    uninstall_command: String,
+}
+
+#[derive(Clone)]
+struct BcuCandidate {
+    id: String,
+    display_name: String,
 }
 
 impl Sprite {
@@ -322,6 +358,8 @@ struct OverlayApp {
     deletion_started: bool,
     audio: Audio,
     error: Option<String>,
+    uninstall_candidate: Option<BcuCandidate>,
+    uninstall_probe: Option<Receiver<Option<BcuCandidate>>>,
 }
 
 impl OverlayApp {
@@ -375,6 +413,8 @@ impl OverlayApp {
             deletion_started: false,
             audio: Audio::new(&assets),
             error: None,
+            uninstall_candidate: None,
+            uninstall_probe: None,
         })
     }
 
@@ -455,7 +495,44 @@ impl OverlayApp {
             }
             Phase::Ask => {
                 if self.choice_rects().iter().any(|rect| rect.contains(x, y)) {
+                    if uninstall_feature_enabled() {
+                        self.begin_uninstall_probe();
+                        self.enter(Phase::DetectUninstall);
+                    } else {
+                        self.enter(Phase::Kick);
+                    }
+                }
+            }
+            Phase::UninstallAsk => {
+                let choices = self.choice_rects();
+                if choices[0].contains(x, y) {
+                    if let Some(app) = self.uninstall_candidate.as_ref() {
+                        match launch_bcu_uninstaller(
+                            &self.target,
+                            &app.id,
+                            uninstall_silent_execution_enabled(),
+                        ) {
+                            Ok(()) => self.enter(Phase::Fly),
+                            Err(error) => {
+                                self.error = Some(format!("无法启动 {} 的官方卸载程序：{error}", app.display_name));
+                                self.enter(Phase::Error);
+                            }
+                        }
+                    } else {
+                        self.enter(Phase::Kick);
+                    }
+                } else if choices[1].contains(x, y) {
                     self.enter(Phase::Kick);
+                }
+            }
+            Phase::UninstallUnavailable => {
+                let choices = self.choice_rects();
+                if choices[0].contains(x, y) {
+                    self.enter(Phase::Kick);
+                } else if choices[1].contains(x, y) {
+                    unsafe {
+                        let _ = DestroyWindow(self.hwnd);
+                    }
                 }
             }
             Phase::Elevate => {
@@ -555,6 +632,25 @@ impl OverlayApp {
                 self.ensure_kick_sequence();
                 self.enter(Phase::Ask);
             }
+            Phase::DetectUninstall => {
+                let result = self.uninstall_probe.as_ref().and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(None),
+                });
+                if let Some(candidate) = result {
+                    self.uninstall_probe = None;
+                    self.uninstall_candidate = candidate;
+                    self.enter(if self.uninstall_candidate.is_some() {
+                        Phase::UninstallAsk
+                    } else {
+                        // Do not silently turn an attempted software uninstall
+                        // into a shortcut deletion. The user must explicitly
+                        // choose that fallback after BCU could not verify it.
+                        Phase::UninstallUnavailable
+                    });
+                }
+            }
             Phase::Kick => {
                 if self.frame() >= 5 && !self.deletion_started {
                     self.trigger_delete();
@@ -570,6 +666,16 @@ impl OverlayApp {
             _ => {}
         }
         self.render();
+    }
+    fn begin_uninstall_probe(&mut self) {
+        let target = self.target.clone();
+        let bridge = resource_dir().join("assets").join("tools").join("bcu-bridge").join("bcu-bridge.exe");
+        let index = uninstall_index_path();
+        let (sender, receiver) = sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(probe_bcu_shortcut(&bridge, &target, &index));
+        });
+        self.uninstall_probe = Some(receiver);
     }
     fn trigger_delete(&mut self) {
         self.deletion_started = true;
@@ -767,11 +873,16 @@ impl OverlayApp {
                 right: rect.w,
                 bottom: rect.h,
             };
+            let format = if text.contains('\n') {
+                DT_CENTER | DT_VCENTER | DT_WORDBREAK
+            } else {
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE
+            };
             let _ = DrawTextW(
                 dc,
                 &mut words,
                 &mut bounds,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                format,
             );
             let raw = slice::from_raw_parts(bits.cast::<u8>(), (rect.w * rect.h * 4) as usize);
             for y in 0..rect.h {
@@ -839,12 +950,24 @@ impl OverlayApp {
             (255, 255, 255, content_alpha),
         );
     }
-    fn draw_bubble_size(&mut self, monster_width: i32, monster_height: i32, position: (i32, i32)) {
+    fn draw_bubble_size(
+        &mut self,
+        monster_width: i32,
+        monster_height: i32,
+        position: (i32, i32),
+        message: &str,
+        first_choice: &str,
+        second_choice: &str,
+    ) {
         let (mx, my) = position;
         // These are the original Qt layout dimensions in logical pixels. The
         // per-monitor scale is applied once here, together with the monster.
         let bubble_w = self.px(220);
-        let bubble_h = self.px(92);
+        let bubble_h = if message.contains('\n') {
+            self.px(112)
+        } else {
+            self.px(92)
+        };
         let margin = self.px(28);
         let tail = self.px(15);
         let raw_x = if self.points_left {
@@ -883,13 +1006,16 @@ impl OverlayApp {
         self.triangle(shadow_tail.0, shadow_tail.1, shadow_tail.2, (0, 0, 0, 28));
         self.triangle(bubble_tail.0, bubble_tail.1, bubble_tail.2, (255, 255, 255, 240));
         self.card(bubble, self.px(20), self.px(8), self.px(14));
-        self.text("喂，是这个吗？", bubble, self.px(20), (28, 28, 30, 255));
+        self.text(message, bubble, self.px(20), (28, 28, 30, 255));
+        if first_choice.is_empty() && second_choice.is_empty() {
+            return;
+        }
         for rect in self.choice_rects() {
             self.card(rect, self.px(18), self.px(5), self.px(10));
         }
         let choices = self.choice_rects();
-        self.text("是的", choices[0], self.px(16), (28, 28, 30, 255));
-        self.text("嘤嘤嘤就是这个", choices[1], self.px(16), (28, 28, 30, 255));
+        self.text(first_choice, choices[0], self.px(16), (28, 28, 30, 255));
+        self.text(second_choice, choices[1], self.px(16), (28, 28, 30, 255));
     }
     fn draw_modal(&mut self, is_error: bool) {
         let rect = if is_error {
@@ -998,7 +1124,7 @@ impl OverlayApp {
                     );
                 }
             }
-            Phase::Ask => {
+            Phase::Ask | Phase::DetectUninstall | Phase::UninstallAsk | Phase::UninstallUnavailable => {
                 if let Some(sprite) = self.point.as_ref() {
                     let position = self.monster_position(sprite);
                     let (w, h) = (sprite.width, sprite.height);
@@ -1014,7 +1140,20 @@ impl OverlayApp {
                         255,
                         self.points_left,
                     );
-                    self.draw_bubble_size(w, h, position);
+                    let (message, first_choice, second_choice) = if self.phase == Phase::UninstallAsk {
+                        if uninstall_silent_execution_enabled() {
+                            ("居然是软件，\n要悄悄卸载吗？", "静默卸载", "就删除快捷方式好啦")
+                        } else {
+                            ("居然是软件，\n需要卸载吗？", "卸载", "就删除快捷方式好啦")
+                        }
+                    } else if self.phase == Phase::UninstallUnavailable {
+                        ("没有查到可用的\n官方卸载器", "删除", "取消")
+                    } else if self.phase == Phase::DetectUninstall {
+                        ("让我查查这是什么……", "", "")
+                    } else {
+                        ("喂，是这个吗？", "是的", "嘤嘤嘤就是这个")
+                    };
+                    self.draw_bubble_size(w, h, position, message, first_choice, second_choice);
                 }
             }
             Phase::Kick => {
@@ -1244,6 +1383,23 @@ fn signed_high_word(value: isize) -> i32 {
     ((value >> 16) as i16) as i32
 }
 
+// SHFileOperation is a legacy shell API. Its 0x78 return value is the
+// shell-specific DE_ACCESSDENIEDSRC status (not Win32 ERROR_CALL_NOT_IMPLEMENTED
+// despite sharing the same numeric value). Normalize it so the regular delete
+// flow can offer the existing UAC retry instead of showing a misleading error.
+const DE_ACCESSDENIEDSRC: i32 = 0x78;
+
+fn recycle_failure_code(status: i32, aborted: bool) -> Option<WIN32_ERROR> {
+    if status == 0 {
+        return aborted.then_some(ERROR_CANCELLED);
+    }
+    Some(if status == DE_ACCESSDENIEDSRC {
+        ERROR_ACCESS_DENIED
+    } else {
+        WIN32_ERROR(status as u32)
+    })
+}
+
 fn recycle(target: &Path, elevated: bool) -> Result<()> {
     let target_wide = wide(target.as_os_str());
     unsafe {
@@ -1259,12 +1415,7 @@ fn recycle(target: &Path, elevated: bool) -> Result<()> {
             ..Default::default()
         };
         let status = SHFileOperationW(&mut operation);
-        if status != 0 || operation.fAnyOperationsAborted.as_bool() {
-            let code = if status == 0 {
-                ERROR_CANCELLED
-            } else {
-                WIN32_ERROR(status as u32)
-            };
+        if let Some(code) = recycle_failure_code(status, operation.fAnyOperationsAborted.as_bool()) {
             return Err(windows::core::Error::new(
                 code.into(),
                 if elevated {
@@ -1297,6 +1448,348 @@ fn request_elevation(target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns an uninstall entry only when a `.lnk` points at an executable that
+/// can be unambiguously tied to one of Windows' registered desktop apps.
+/// Ambiguous, stale, or incomplete entries intentionally fall back to normal
+/// shortcut deletion.
+fn installed_app_for_shortcut(shortcut: &Path) -> Option<InstalledApp> {
+    if !shortcut
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+    {
+        return None;
+    }
+    let target = shortcut_target(shortcut)?;
+    if !target
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return None;
+    }
+    let target = normalized_path(&target)?;
+    let mut matches = Vec::new();
+    matches.extend(uninstall_matches_in_hive(
+        HKEY_LOCAL_MACHINE,
+        KEY_WOW64_64KEY,
+        &target,
+    ));
+    matches.extend(uninstall_matches_in_hive(
+        HKEY_LOCAL_MACHINE,
+        KEY_WOW64_32KEY,
+        &target,
+    ));
+    matches.extend(uninstall_matches_in_hive(HKEY_CURRENT_USER, KEY_READ, &target));
+    matches.sort_by(|left, right| left.uninstall_command.cmp(&right.uninstall_command));
+    matches.dedup_by(|left, right| left.uninstall_command == right.uninstall_command);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn shortcut_target(shortcut: &Path) -> Option<PathBuf> {
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+            let persist: IPersistFile = link.cast().ok()?;
+            let shortcut_wide = wide(shortcut.as_os_str());
+            persist.Load(PCWSTR(shortcut_wide.as_ptr()), STGM_READ).ok()?;
+            let mut target = [0u16; 32_768];
+            link.GetPath(&mut target, null_mut(), 0).ok()?;
+            let end = target.iter().position(|unit| *unit == 0)?;
+            (end > 0).then(|| PathBuf::from(String::from_utf16_lossy(&target[..end])))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+fn uninstall_matches_in_hive(root: HKEY, view: windows::Win32::System::Registry::REG_SAM_FLAGS, target: &str) -> Vec<InstalledApp> {
+    const UNINSTALL_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    unsafe {
+        let base = wide(UNINSTALL_KEY);
+        let mut uninstall_key = HKEY::default();
+        if RegOpenKeyExW(root, PCWSTR(base.as_ptr()), None, KEY_READ | view, &mut uninstall_key)
+            != WIN32_ERROR(0)
+        {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        let mut index = 0;
+        loop {
+            let mut name = [0u16; 512];
+            let mut name_len = (name.len() - 1) as u32;
+            let status = RegEnumKeyExW(
+                uninstall_key,
+                index,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                None,
+                None,
+                None,
+                None,
+            );
+            if status == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            index += 1;
+            if status != WIN32_ERROR(0) {
+                continue;
+            }
+            let child_name = wide(String::from_utf16_lossy(&name[..name_len as usize]));
+            let mut child = HKEY::default();
+            if RegOpenKeyExW(uninstall_key, PCWSTR(child_name.as_ptr()), None, KEY_READ, &mut child)
+                != WIN32_ERROR(0)
+            {
+                continue;
+            }
+            let display_name = registry_string(child, "DisplayName");
+            let uninstall_command = registry_string(child, "UninstallString");
+            let install_location = registry_string(child, "InstallLocation");
+            let display_icon = registry_string(child, "DisplayIcon");
+            let _ = RegCloseKey(child);
+            let (Some(display_name), Some(uninstall_command)) = (display_name, uninstall_command)
+            else {
+                continue;
+            };
+            if display_name.trim().is_empty()
+                || parse_uninstall_command(&uninstall_command).is_none()
+            {
+                continue;
+            }
+            let in_install_location = install_location
+                .as_deref()
+                .and_then(normalized_path_string)
+                .is_some_and(|location| path_is_within(target, &location));
+            let is_display_icon = display_icon
+                .as_deref()
+                .and_then(display_icon_path)
+                .and_then(|path| normalized_path(&path))
+                .is_some_and(|path| path == target);
+            if in_install_location || is_display_icon {
+                matches.push(InstalledApp {
+                    display_name,
+                    uninstall_command,
+                });
+            }
+        }
+        let _ = RegCloseKey(uninstall_key);
+        matches
+    }
+}
+
+unsafe fn registry_string(key: HKEY, name: &str) -> Option<String> {
+    let name = wide(name);
+    let mut value_type = REG_VALUE_TYPE(0);
+    let mut bytes = 0u32;
+    if RegQueryValueExW(
+        key,
+        PCWSTR(name.as_ptr()),
+        None,
+        Some(&mut value_type),
+        None,
+        Some(&mut bytes),
+    ) != WIN32_ERROR(0)
+        || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ)
+        || bytes < 2
+        || bytes > 65_536
+    {
+        return None;
+    }
+    let mut raw = vec![0u8; bytes as usize + 2];
+    if RegQueryValueExW(
+        key,
+        PCWSTR(name.as_ptr()),
+        None,
+        Some(&mut value_type),
+        Some(raw.as_mut_ptr()),
+        Some(&mut bytes),
+    ) != WIN32_ERROR(0)
+    {
+        return None;
+    }
+    let units = slice::from_raw_parts(raw.as_ptr().cast::<u16>(), bytes as usize / 2);
+    let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
+    Some(expand_environment(&String::from_utf16_lossy(&units[..end])))
+}
+
+fn expand_environment(value: &str) -> String {
+    unsafe {
+        let source = wide(value);
+        let required = ExpandEnvironmentStringsW(PCWSTR(source.as_ptr()), None);
+        if required == 0 || required > 32_768 {
+            return value.to_owned();
+        }
+        let mut expanded = vec![0u16; required as usize];
+        let written = ExpandEnvironmentStringsW(PCWSTR(source.as_ptr()), Some(&mut expanded));
+        if written == 0 || written > required {
+            return value.to_owned();
+        }
+        String::from_utf16_lossy(&expanded[..written.saturating_sub(1) as usize])
+    }
+}
+
+fn normalized_path(path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    normalized_path_string(&canonical.to_string_lossy())
+}
+
+fn normalized_path_string(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('"').replace('/', "\\");
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.trim_end_matches('\\').to_ascii_lowercase())
+}
+
+fn path_is_within(path: &str, directory: &str) -> bool {
+    path == directory || path.starts_with(&(directory.to_owned() + "\\"))
+}
+
+fn display_icon_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    let path = if let Some(rest) = value.strip_prefix('"') {
+        rest.split_once('"')?.0
+    } else {
+        value.split_once(',').map_or(value, |(path, _)| path).trim()
+    };
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn parse_uninstall_command(command: &str) -> Option<(String, String)> {
+    let command = command.trim();
+    let (program, arguments) = if let Some(rest) = command.strip_prefix('"') {
+        let (program, arguments) = rest.split_once('"')?;
+        (program.trim(), arguments.trim())
+    } else {
+        let mut parts = command.splitn(2, char::is_whitespace);
+        (parts.next()?.trim(), parts.next().unwrap_or("").trim())
+    };
+    if program.is_empty() || !is_allowed_uninstall_host(program) {
+        return None;
+    }
+    Some((program.to_owned(), arguments.to_owned()))
+}
+
+fn is_allowed_uninstall_host(program: &str) -> bool {
+    if Path::new(program).is_file() {
+        return true;
+    }
+    matches!(
+        program.rsplit(['\\', '/']).next().unwrap_or(program).to_ascii_lowercase().as_str(),
+        "msiexec" | "msiexec.exe" | "rundll32" | "rundll32.exe"
+    )
+}
+
+fn launch_official_uninstaller(command: &str) -> Result<()> {
+    let (program, arguments) = parse_uninstall_command(command)
+        .ok_or_else(windows::core::Error::from_thread)?;
+    let verb = wide("open");
+    let program = wide(program);
+    let arguments = wide(arguments);
+    unsafe {
+        // ShellExecuteW receives the executable and arguments separately: no
+        // command interpreter is involved, so registry text cannot be treated
+        // as a shell expression.
+        let result = ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(program.as_ptr()),
+            PCWSTR(arguments.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        if result.0 as isize <= 32 {
+            return Err(windows::core::Error::from_thread());
+        }
+    }
+    Ok(())
+}
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn bcu_bridge_path() -> PathBuf {
+    resource_dir()
+        .join("assets")
+        .join("tools")
+        .join("bcu-bridge")
+        .join("bcu-bridge.exe")
+}
+
+fn probe_bcu_shortcut(bridge: &Path, shortcut: &Path, index: &Path) -> Option<BcuCandidate> {
+    if !bridge.is_file()
+        || !shortcut
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+    {
+        return None;
+    }
+    let output = Command::new(bridge)
+        .arg("resolve")
+        .arg(shortcut)
+        .arg(index)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = output_text.trim().split('\t');
+    (fields.next()? == "MATCH").then_some(())?;
+    let id = fields.next()?.trim();
+    let display_name = fields.next()?.trim();
+    if id.is_empty() || display_name.is_empty() || fields.next().is_some() {
+        return None;
+    }
+    Some(BcuCandidate {
+        id: id.to_owned(),
+        display_name: String::from_utf8(base64_decode(display_name)?).ok()?,
+    })
+}
+
+fn launch_bcu_uninstaller(shortcut: &Path, candidate_id: &str, quiet: bool) -> Result<()> {
+    let bridge = bcu_bridge_path();
+    if !bridge.is_file() {
+        return Err(windows::core::Error::from_thread());
+    }
+    let mut command = Command::new(bridge);
+    command
+        .arg("uninstall")
+        .arg(shortcut)
+        .arg(candidate_id)
+        .creation_flags(CREATE_NO_WINDOW);
+    if quiet {
+        command.arg("--quiet");
+    }
+    command.spawn().map_err(|_| windows::core::Error::from_thread())?;
+    Ok(())
+}
+
+fn base64_decode(value: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(value.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in value.bytes().take_while(|byte| *byte != b'=') {
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | digit;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
 unsafe fn restore_default_cursor() {
     if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
         let _ = SetCursor(Some(cursor));
@@ -1314,6 +1807,93 @@ fn resource_dir() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
 }
+
+fn user_config_path() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resource_dir())
+        .join("MonsterDeleter")
+        .join("config.toml")
+}
+
+fn uninstall_index_path() -> PathBuf {
+    user_config_path().with_file_name("uninstall-index.tsv")
+}
+
+fn uninstall_feature_enabled() -> bool {
+    fs::read_to_string(user_config_path())
+        .ok()
+        .is_none_or(|contents| !contents.contains("enabled = false"))
+}
+
+fn uninstall_silent_execution_enabled() -> bool {
+    uninstall_feature_enabled()
+        && fs::read_to_string(user_config_path()).ok().is_some_and(|contents| {
+            contents.contains("mode = \"silent\"") || contents.contains("mode = \"force_silent\"")
+        })
+}
+
+fn write_user_config(uninstall_enabled: bool, silent_execution: bool) -> std::io::Result<()> {
+    let path = user_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mode = if uninstall_enabled && silent_execution { "silent" } else { "official" };
+    fs::write(
+        path,
+        format!(
+            "# MonsterDeleter 用户配置（可直接用记事本修改）\n\
+[uninstall]\n\
+enabled = {uninstall_enabled}\n\
+# enabled = false: 直接执行小怪兽删除，不显示软件卸载询问\n\
+# official: 使用软件自身的正常卸载界面\n\
+# silent: 卸载功能静默执行；仍可能显示 UAC 或厂商窗口\n\
+mode = \"{mode}\"\n\
+# 默认不扫描或清理残留项\n\
+cleanup_after_uninstall = false\n"
+        ),
+    )
+}
+
+fn show_settings() -> Result<()> {
+    let enabled = uninstall_feature_enabled();
+    let silent_execution = uninstall_silent_execution_enabled();
+    let title = wide("Monster Deleter 设置");
+    let config_path = user_config_path();
+    let uninstall_content = wide(format!(
+        "当前：{}。\n\n启用卸载功能吗？\n\n启用后，确认删除软件快捷方式时，会额外询问是否调用该软件的官方卸载程序；关闭后始终执行原有的小怪兽删除逻辑。\n\n设置保存在：{}",
+        if enabled { "已启用" } else { "未启用" },
+        config_path.display()
+    ));
+    let uninstall_result = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(uninstall_content.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    let uninstall_enabled = uninstall_result == IDYES;
+    let silent = if uninstall_enabled {
+        let silent_content = wide(format!(
+            "当前：{}。\n\n让卸载功能静默执行吗？\n\n选择“是”会尽量跳过软件自身的卸载界面；仍可能显示 UAC 或厂商窗口。选择“否”则使用官方卸载界面。",
+            if silent_execution { "静默执行" } else { "正常执行" }
+        ));
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(silent_content.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_YESNO | MB_ICONWARNING,
+            ) == IDYES
+        }
+    } else {
+        false
+    };
+    write_user_config(uninstall_enabled, silent).map_err(|_| windows::core::Error::from_thread())?;
+    Ok(())
+}
+
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -1321,8 +1901,12 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 fn main() {
     let mut args = env::args_os();
     let _ = args.next();
-    if args
-        .next()
+    let first_arg = args.next();
+    if first_arg.as_deref().is_some_and(|value| value == "--settings") {
+        let _ = show_settings();
+        return;
+    }
+    if first_arg
         .as_deref()
         .is_some_and(|value| value == "--elevated-delete")
     {
@@ -1333,4 +1917,42 @@ fn main() {
     }
     let target = env::args_os().nth(1).map(PathBuf::from).unwrap_or_default();
     let _ = run_overlay(target);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{base64_decode, parse_uninstall_command, recycle_failure_code, DE_ACCESSDENIEDSRC};
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_CANCELLED};
+
+    #[test]
+    fn accepts_the_windows_installer_host_without_a_shell() {
+        assert_eq!(
+            parse_uninstall_command("msiexec.exe /x {01234567-89AB-CDEF-0123-456789ABCDEF}"),
+            Some((
+                "msiexec.exe".to_owned(),
+                "/x {01234567-89AB-CDEF-0123-456789ABCDEF}".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_command_interpreters() {
+        assert_eq!(parse_uninstall_command("cmd.exe /c del C:\\data"), None);
+        assert_eq!(parse_uninstall_command("powershell.exe -Command Remove-Item"), None);
+    }
+
+    #[test]
+    fn decodes_bridge_text_without_a_parser_dependency() {
+        assert_eq!(base64_decode("5bCP5oCq5YW9"), Some("小怪兽".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn maps_legacy_shell_access_denied_to_a_uac_retry() {
+        assert_eq!(
+            recycle_failure_code(DE_ACCESSDENIEDSRC, false),
+            Some(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(recycle_failure_code(0, true), Some(ERROR_CANCELLED));
+        assert_eq!(recycle_failure_code(0, false), None);
+    }
 }

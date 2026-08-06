@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.18362.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>bcu-bridge</AssemblyName>
+    <RootNamespace>MonsterDeleter.BcuBridge</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\.vendor-cache\Bulk-Crap-Uninstaller-6.1\source\UninstallTools\UninstallTools.csproj" />
+  </ItemGroup>
+</Project>

@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "monster-deleter"
-version = "1.0.7"
+version = "1.0.12"
 dependencies = [
  "image",
  "windows",

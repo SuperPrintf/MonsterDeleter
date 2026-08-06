@@ -4,6 +4,10 @@
 # Reproducible local build output.
 /target/
 /dist/
+/.vendor-cache/
+/assets/tools/bcu-bridge/
+/tools/bcu-bridge/bin/
+/tools/bcu-bridge/obj/
 
 # One-off visual verification captures.
 /selection-*.png
