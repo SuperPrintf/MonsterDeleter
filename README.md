@@ -71,7 +71,7 @@ cargo build --release
 
 ## 发布与跨平台规划
 
-正式安装包通过 GitHub Releases 的附件分发，而不提交到代码树；当前 Windows x64 基线版本为 `v1.0.5`。每个正式版本以标签（如 `v1.1.0`）标记，仓库中的 GitHub Actions 会保留对应构建的安装包制品。`releases/` 目录仅存放发行约定和说明。
+正式安装包通过 GitHub Releases 的附件分发，而不提交到代码树；当前 Windows x64 基线版本为 `v1.0.7`。每个正式版本以标签（如 `v1.1.0`）标记，仓库中的 GitHub Actions 会保留对应构建的安装包制品。`releases/` 目录仅存放发行约定和说明。
 
 `platforms/windows`、`platforms/linux` 与 `platforms/macos` 预留了各平台入口和打包方式。动画状态机、素材编排和删除策略应逐步下沉为平台无关 Rust 核心；各平台目录仅实现对应的文件管理器菜单、透明覆盖层、权限请求和安装包适配。这样新增平台时不会破坏 Windows 版本的行为。
 
