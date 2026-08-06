@@ -25,14 +25,15 @@ use windows::{
             CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC,
             DeleteObject, DrawTextW, GetMonitorInfoW, MonitorFromPoint, SelectObject, SetBkMode,
             SetTextColor, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-            CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-            DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FONT_FAMILY, FW_BOLD, MONITORINFO,
+            ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+            DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FONT_FAMILY,
+            MONITORINFO,
             MONITOR_DEFAULTTONEAREST, OUT_TT_PRECIS, TRANSPARENT,
         },
         Media::Multimedia::mciSendStringW,
         Storage::FileSystem::GetFileAttributesW,
         UI::{
-            HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
+            HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS},
             Shell::{
                 SHFileOperationW, ShellExecuteW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
@@ -40,8 +41,9 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
-                DispatchMessageW, GetCursorPos, GetMessageW, PostQuitMessage, RegisterClassW,
-                SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+                DispatchMessageW, GetCursorPos, GetMessageW, LoadCursorW, PostQuitMessage,
+                RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                TranslateMessage, IDC_ARROW,
                 UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR,
                 HWND_TOPMOST, ICONINFO, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOW,
                 SW_SHOWNORMAL, ULW_ALPHA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
@@ -133,21 +135,33 @@ struct Audio {
 impl Audio {
     fn new(assets: &Path) -> Self {
         let files = [
-            ("monster_bgm", assets.join("音频").join("bgm(1).mp3"), 500),
+            (
+                "monster_bgm",
+                assets.join("音频").join("bgm(1).mp3"),
+                "mpegvideo",
+                500,
+            ),
             (
                 "monster_talk",
-                assets.join("音频").join("怪兽说话.mp3"),
+                assets.join("音频").join("monster-talk.wav"),
+                "waveaudio",
                 1000,
             ),
-            ("monster_boom", assets.join("音频").join("爆炸.MP4"), 300),
+            (
+                "monster_boom",
+                assets.join("音频").join("monster-boom.wav"),
+                "waveaudio",
+                300,
+            ),
         ];
         let mut aliases = Vec::new();
-        for (alias, path, volume) in files {
-            if path.exists() {
-                mci(&format!(
-                    "open \"{}\" type mpegvideo alias {alias}",
+        for (alias, path, device_type, volume) in files {
+            if path.exists()
+                && mci(&format!(
+                    "open \"{}\" type {device_type} alias {alias}",
                     path.display()
-                ));
+                )) == 0
+            {
                 mci(&format!("setaudio {alias} volume to {volume}"));
                 aliases.push(alias.to_owned());
             }
@@ -288,6 +302,7 @@ struct OverlayApp {
     height: i32,
     screen_x: i32,
     screen_y: i32,
+    ui_scale: f32,
     pixels: Vec<u8>,
     assets: PathBuf,
     background: Option<RgbaImage>,
@@ -340,6 +355,7 @@ impl OverlayApp {
             height,
             screen_x,
             screen_y,
+            ui_scale: 1.0,
             pixels: vec![0; width as usize * height as usize * 4],
             assets: assets.clone(),
             background,
@@ -365,6 +381,9 @@ impl OverlayApp {
     fn elapsed(&self) -> f32 {
         self.phase_started.elapsed().as_secs_f32()
     }
+    fn px(&self, logical_pixels: i32) -> i32 {
+        ((logical_pixels as f32 * self.ui_scale).round() as i32).max(1)
+    }
     fn enter(&mut self, phase: Phase) {
         self.phase = phase;
         self.phase_started = Instant::now();
@@ -384,7 +403,7 @@ impl OverlayApp {
         if self.walk.is_none() {
             self.walk = Sprite::load(
                 &self.assets.join("走路动效_spritesheet_transparent.png"),
-                250,
+                self.px(250) as u32,
             );
         }
     }
@@ -392,7 +411,7 @@ impl OverlayApp {
         if self.point.is_none() {
             self.point = Sprite::load(
                 &self.assets.join("指着文件_spritesheet_transparent.png"),
-                250,
+                self.px(250) as u32,
             );
         }
     }
@@ -400,23 +419,26 @@ impl OverlayApp {
         if self.kick.is_none() {
             self.kick = Sprite::load(
                 &self.assets.join("踹文件动效_spritesheet_transparent.png"),
-                250,
+                self.px(250) as u32,
             );
         }
         if self.explosion.is_none() {
             self.explosion =
-                Sprite::load(&self.assets.join("爆炸_spritesheet_transparent.png"), 150);
+                Sprite::load(
+                    &self.assets.join("爆炸_spritesheet_transparent.png"),
+                    self.px(150) as u32,
+                );
         }
         if self.leo.is_none() {
             self.leo = Sprite::load(
                 &self.assets.join("雷欧登场_spritesheet_transparent.png"),
-                250,
+                self.px(250) as u32,
             );
         }
         if self.fly.is_none() {
             self.fly = Sprite::load(
                 &self.assets.join("出场飞行动效_spritesheet_transparent.png"),
-                250,
+                self.px(250) as u32,
             );
         }
     }
@@ -425,6 +447,9 @@ impl OverlayApp {
             Phase::Select => {
                 self.target_position = (x, y);
                 self.points_left = x < self.width / 2;
+                // The targeting crosshair belongs only to selection. Restore the
+                // normal cursor before the fade/monster sequence begins.
+                unsafe { restore_default_cursor() };
                 self.ensure_walk();
                 self.enter(Phase::FadeOut);
             }
@@ -479,26 +504,28 @@ impl OverlayApp {
         } else {
             (self.target_position.0, self.target_position.1, 250, 250)
         };
-        let group_width = 297;
-        let button_x = (mx + mw / 2 - group_width / 2).clamp(12, self.width - group_width - 12);
-        let below = my + mh + 68 <= self.height - 12;
+        let group_width = self.px(297);
+        let margin = self.px(12);
+        let button_x = (mx + mw / 2 - group_width / 2)
+            .clamp(margin, self.width - group_width - margin);
+        let below = my + mh + self.px(68) <= self.height - margin;
         let button_y = if below {
-            my + mh + 16
+            my + mh + self.px(16)
         } else {
-            (my - 68).max(12)
+            (my - self.px(68)).max(margin)
         };
         [
             RectI {
                 x: button_x,
                 y: button_y,
-                w: 92,
-                h: 52,
+                w: self.px(92),
+                h: self.px(52),
             },
             RectI {
-                x: button_x + 107,
+                x: button_x + self.px(107),
                 y: button_y,
-                w: 190,
-                h: 52,
+                w: self.px(190),
+                h: self.px(52),
             },
         ]
     }
@@ -517,13 +544,16 @@ impl OverlayApp {
                 self.ensure_point();
                 self.enter(Phase::Walk);
             }
-            Phase::Walk if self.elapsed() >= 4.5 => self.enter(Phase::Point),
+            // Match the original Qt sequence: the question SFX starts exactly
+            // when the four-frame pointing animation starts and continues into
+            // the question bubble; it is not restarted when the bubble appears.
+            Phase::Walk if self.elapsed() >= 4.5 => {
+                self.audio.play("monster_talk");
+                self.enter(Phase::Point);
+            }
             Phase::Point if self.elapsed() >= 0.5 => {
                 self.ensure_kick_sequence();
                 self.enter(Phase::Ask);
-                // Keep the original talking sound, but synchronize it with the
-                // visible question so it is never lost during the point transition.
-                self.audio.play("monster_talk");
             }
             Phase::Kick => {
                 if self.frame() >= 5 && !self.deletion_started {
@@ -599,27 +629,95 @@ impl OverlayApp {
         }
     }
     fn rect(&mut self, rect: RectI, color: (u8, u8, u8, u8), radius: i32) {
-        for y in 0..rect.h {
-            for x in 0..rect.w {
-                let dx = if x < radius {
-                    radius - x
-                } else if x >= rect.w - radius {
-                    x - (rect.w - radius - 1)
-                } else {
-                    0
-                };
-                let dy = if y < radius {
-                    radius - y
-                } else if y >= rect.h - radius {
-                    y - (rect.h - radius - 1)
-                } else {
-                    0
-                };
-                if dx * dx + dy * dy <= radius * radius {
-                    self.blend(rect.x + x, rect.y + y, color.0, color.1, color.2, color.3);
+        for y in rect.y - 1..rect.y + rect.h + 1 {
+            for x in rect.x - 1..rect.x + rect.w + 1 {
+                let coverage = (0.5 - Self::rounded_distance(rect, radius, x as f32 + 0.5, y as f32 + 0.5))
+                    .clamp(0.0, 1.0);
+                if coverage > 0.0 {
+                    self.blend(
+                        x,
+                        y,
+                        color.0,
+                        color.1,
+                        color.2,
+                        (color.3 as f32 * coverage) as u8,
+                    );
                 }
             }
         }
+    }
+    fn rounded_distance(rect: RectI, radius: i32, x: f32, y: f32) -> f32 {
+        let radius = radius.clamp(0, rect.w.min(rect.h) / 2) as f32;
+        let center_x = rect.x as f32 + rect.w as f32 / 2.0;
+        let center_y = rect.y as f32 + rect.h as f32 / 2.0;
+        let qx = (x - center_x).abs() - (rect.w as f32 / 2.0 - radius);
+        let qy = (y - center_y).abs() - (rect.h as f32 / 2.0 - radius);
+        let outside = qx.max(0.0).hypot(qy.max(0.0));
+        outside + qx.max(qy).min(0.0) - radius
+    }
+    fn shadow(&mut self, rect: RectI, radius: i32, offset_y: i32, blur: i32, alpha: u8) {
+        let shifted = RectI {
+            y: rect.y + offset_y,
+            ..rect
+        };
+        let extent = blur * 2;
+        for y in shifted.y - extent..shifted.y + shifted.h + extent {
+            for x in shifted.x - extent..shifted.x + shifted.w + extent {
+                let distance = Self::rounded_distance(shifted, radius, x as f32 + 0.5, y as f32 + 0.5);
+                let opacity = if distance <= 0.0 {
+                    1.0
+                } else {
+                    (1.0 - distance / blur.max(1) as f32).clamp(0.0, 1.0).powi(2)
+                };
+                if opacity > 0.0 {
+                    self.blend(x, y, 0, 0, 0, (alpha as f32 * opacity) as u8);
+                }
+            }
+        }
+    }
+    fn triangle(&mut self, a: (i32, i32), b: (i32, i32), c: (i32, i32), color: (u8, u8, u8, u8)) {
+        let min_x = a.0.min(b.0).min(c.0) - 1;
+        let max_x = a.0.max(b.0).max(c.0) + 1;
+        let min_y = a.1.min(b.1).min(c.1) - 1;
+        let max_y = a.1.max(b.1).max(c.1) + 1;
+        let edge = |from: (i32, i32), to: (i32, i32), point: (f32, f32)| {
+            (to.0 - from.0) as f32 * (point.1 - from.1 as f32)
+                - (to.1 - from.1) as f32 * (point.0 - from.0 as f32)
+        };
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let mut inside = 0u8;
+                for (sx, sy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                    let point = (x as f32 + sx, y as f32 + sy);
+                    let e1 = edge(a, b, point);
+                    let e2 = edge(b, c, point);
+                    let e3 = edge(c, a, point);
+                    if !((e1 < 0.0 || e2 < 0.0 || e3 < 0.0)
+                        && (e1 > 0.0 || e2 > 0.0 || e3 > 0.0))
+                    {
+                        inside += 1;
+                    }
+                }
+                if inside > 0 {
+                    self.blend(x, y, color.0, color.1, color.2, color.3 * inside / 4);
+                }
+            }
+        }
+    }
+    fn card(&mut self, rect: RectI, radius: i32, shadow_offset: i32, shadow_blur: i32) {
+        self.shadow(rect, radius, shadow_offset, shadow_blur, 34);
+        self.rect(rect, (229, 229, 234, 215), radius);
+        let inset = self.px(1);
+        self.rect(
+            RectI {
+                x: rect.x + inset,
+                y: rect.y + inset,
+                w: rect.w - inset * 2,
+                h: rect.h - inset * 2,
+            },
+            (255, 255, 255, 240),
+            (radius - inset).max(1),
+        );
     }
     fn text(&mut self, text: &str, rect: RectI, size: i32, color: (u8, u8, u8, u8)) {
         unsafe {
@@ -642,20 +740,20 @@ impl OverlayApp {
             };
             let dc = CreateCompatibleDC(None);
             let old = SelectObject(dc, bitmap.into());
-            let face = wide("Microsoft YaHei");
+            let face = wide("Segoe UI");
             let font = CreateFontW(
                 -size,
                 0,
                 0,
                 0,
-                FW_BOLD.0 as i32,
+                600,
                 0,
                 0,
                 0,
                 DEFAULT_CHARSET,
                 OUT_TT_PRECIS,
                 CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
+                ANTIALIASED_QUALITY,
                 DEFAULT_PITCH.0 as u32 | FONT_FAMILY(FF_DONTCARE.0).0 as u32,
                 PCWSTR(face.as_ptr()),
             );
@@ -743,54 +841,55 @@ impl OverlayApp {
     }
     fn draw_bubble_size(&mut self, monster_width: i32, monster_height: i32, position: (i32, i32)) {
         let (mx, my) = position;
-        let bubble_w = 260;
-        let bubble_h = 78;
+        // These are the original Qt layout dimensions in logical pixels. The
+        // per-monitor scale is applied once here, together with the monster.
+        let bubble_w = self.px(220);
+        let bubble_h = self.px(92);
+        let margin = self.px(28);
+        let tail = self.px(15);
         let raw_x = if self.points_left {
-            mx + monster_width + 18
+            mx + monster_width + self.px(18)
         } else {
-            mx - bubble_w - 18
+            mx - bubble_w - self.px(18)
         };
-        let x = raw_x.clamp(12, self.width - bubble_w - 12);
+        let x = raw_x.clamp(margin, self.width - bubble_w - margin);
         let side_y = my + monster_height * 30 / 100 - bubble_h / 2;
-        let below = side_y < 12;
+        let below = side_y < margin;
         let y = if below {
-            my + monster_height + 20
+            my + monster_height + self.px(20)
         } else {
-            side_y.min(self.height - bubble_h - 12)
-        };
+            side_y
+        }
+        .clamp(margin, self.height - bubble_h - margin);
         let bubble = RectI {
             x,
             y,
             w: bubble_w,
             h: bubble_h,
         };
-        self.rect(
-            RectI {
-                x,
-                y: y + 8,
-                w: bubble_w,
-                h: bubble_h,
-            },
-            (0, 0, 0, 35),
-            20,
+        let target_y = (my + monster_height / 2).clamp(y + tail, y + bubble_h - tail);
+        let bubble_tail = if below {
+            ((x + bubble_w / 2 - tail, y), (x + bubble_w / 2 + tail, y), (x + bubble_w / 2, y - tail))
+        } else if self.points_left {
+            ((x, target_y - tail), (x, target_y + tail), (x - tail, target_y))
+        } else {
+            ((x + bubble_w, target_y - tail), (x + bubble_w, target_y + tail), (x + bubble_w + tail, target_y))
+        };
+        let shadow_tail = (
+            (bubble_tail.0 .0, bubble_tail.0 .1 + self.px(7)),
+            (bubble_tail.1 .0, bubble_tail.1 .1 + self.px(7)),
+            (bubble_tail.2 .0, bubble_tail.2 .1 + self.px(7)),
         );
-        self.rect(bubble, (255, 255, 255, 240), 20);
-        self.text("喂，是这个吗？", bubble, 20, (28, 28, 30, 255));
+        self.triangle(shadow_tail.0, shadow_tail.1, shadow_tail.2, (0, 0, 0, 28));
+        self.triangle(bubble_tail.0, bubble_tail.1, bubble_tail.2, (255, 255, 255, 240));
+        self.card(bubble, self.px(20), self.px(8), self.px(14));
+        self.text("喂，是这个吗？", bubble, self.px(20), (28, 28, 30, 255));
         for rect in self.choice_rects() {
-            self.rect(
-                RectI {
-                    x: rect.x,
-                    y: rect.y + 5,
-                    ..rect
-                },
-                (0, 0, 0, 30),
-                18,
-            );
-            self.rect(rect, (255, 255, 255, 240), 18);
+            self.card(rect, self.px(18), self.px(5), self.px(10));
         }
         let choices = self.choice_rects();
-        self.text("是的", choices[0], 16, (28, 28, 30, 255));
-        self.text("嘤嘤嘤就是这个", choices[1], 16, (28, 28, 30, 255));
+        self.text("是的", choices[0], self.px(16), (28, 28, 30, 255));
+        self.text("嘤嘤嘤就是这个", choices[1], self.px(16), (28, 28, 30, 255));
     }
     fn draw_modal(&mut self, is_error: bool) {
         let rect = if is_error {
@@ -1067,7 +1166,7 @@ unsafe extern "system" fn window_proc(
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_SETCURSOR if matches!(app.phase, Phase::Select | Phase::FadeOut) => {
+        WM_SETCURSOR if matches!(app.phase, Phase::Select) => {
             let _ = SetCursor(Some(app.target_cursor));
             LRESULT(1)
         }
@@ -1114,6 +1213,7 @@ fn run_overlay(target: PathBuf) -> Result<()> {
             Some(app.cast()),
         )?;
         (*app).hwnd = hwnd;
+        (*app).ui_scale = (GetDpiForWindow(hwnd) as f32 / 96.0).clamp(1.0, 2.0);
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -1197,9 +1297,15 @@ fn request_elevation(target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn mci(command: &str) {
+unsafe fn restore_default_cursor() {
+    if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+        let _ = SetCursor(Some(cursor));
+    }
+}
+
+fn mci(command: &str) -> u32 {
     unsafe {
-        let _ = mciSendStringW(PCWSTR(wide(command).as_ptr()), None, None);
+        mciSendStringW(PCWSTR(wide(command).as_ptr()), None, None)
     }
 }
 fn resource_dir() -> PathBuf {

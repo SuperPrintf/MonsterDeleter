@@ -1,5 +1,5 @@
 #define AppName "Monster Deleter"
-#define AppVersion "1.0.5"
+#define AppVersion "1.0.7"
 #define AppExeName "monster-deleter.exe"
 
 [Setup]
