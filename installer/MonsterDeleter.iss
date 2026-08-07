@@ -1,5 +1,5 @@
 #define AppName "Monster Deleter"
-#define AppVersion "1.0.12"
+#define AppVersion "1.0.17"
 #define AppExeName "monster-deleter.exe"
 
 [Setup]
@@ -10,7 +10,7 @@ DefaultDirName={autopf}\MonsterDeleter
 DefaultGroupName={#AppName}
 UninstallDisplayName={#AppName}
 OutputDir=..\dist
-OutputBaseFilename=MonsterDeleter-Setup
+OutputBaseFilename=MonsterDeleter-Setup-{#AppVersion}
 SetupIconFile=..\assets\branding\monster-head-v2.ico
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
@@ -40,6 +40,11 @@ Name: "{group}\Monster Deleter 设置"; Filename: "{app}\{#AppExeName}"; Paramet
 Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
 Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
+; Explorer resolves %1 to a shortcut's target for wildcard verbs. Register the
+; same verb on lnkfile so shortcut invocations receive the .lnk path itself.
+Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
+Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
 Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
 Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
@@ -66,17 +71,20 @@ begin
     Mode := 'silent'
   else
     Mode := 'official';
-  ConfigPath := ExpandConstant('{userappdata}\MonsterDeleter\config.toml');
+  ConfigPath := ExpandConstant('{userappdata}\MonsterDeleter\config.json');
   ForceDirectories(ExtractFileDir(ConfigPath));
   SaveStringToFile(ConfigPath,
-    '# MonsterDeleter 用户配置（可直接用记事本修改）' + #13#10 +
-    '[uninstall]' + #13#10 +
-    'enabled = ' + EnabledText + #13#10 +
-    '# enabled = false: 直接执行小怪兽删除，不显示软件卸载询问' + #13#10 +
-    '# official: 使用软件自身的正常卸载界面' + #13#10 +
-    '# silent: 卸载功能静默执行；仍可能显示 UAC 或厂商窗口' + #13#10 +
-    'mode = "' + Mode + '"' + #13#10 +
-    'cleanup_after_uninstall = false' + #13#10, False);
+    '{' + #13#10 +
+    '  "uninstall": {' + #13#10 +
+    '    "enabled": ' + EnabledText + ',' + #13#10 +
+    '    "mode": "' + Mode + '",' + #13#10 +
+    '    "target_patterns": [' + #13#10 +
+    '      "(?i)^.*\\.lnk$",' + #13#10 +
+    '      "(?i)^.*\\.exe$"' + #13#10 +
+    '    ],' + #13#10 +
+    '    "cleanup_after_uninstall": false' + #13#10 +
+    '  }' + #13#10 +
+    '}' + #13#10, False);
 end;
 
 function ShouldBuildUninstallIndex(): Boolean;
