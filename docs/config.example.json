@@ -1,0 +1,11 @@
+{
+  "uninstall": {
+    "enabled": true,
+    "mode": "official",
+    "target_patterns": [
+      "(?i)^.*\\.lnk$",
+      "(?i)^.*\\.exe$"
+    ],
+    "cleanup_after_uninstall": false
+  }
+}

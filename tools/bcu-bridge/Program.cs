@@ -13,6 +13,8 @@ namespace MonsterDeleter.BcuBridge;
 
 internal static class Program
 {
+    private const int MaxShortcutResolutionHops = 4;
+
     private static int Main(string[] args)
     {
         try
@@ -34,19 +36,30 @@ internal static class Program
 
     private static int Resolve(string shortcut, string? indexPath)
     {
+        // A resolvable executable shortcut is distinct from a plain file
+        // shortcut: the overlay can offer a safe "delete shortcut only"
+        // choice even when no official uninstaller can be found.
+        if (ResolveApplicationTarget(shortcut) is null)
+            return 2;
+
         var indexedCandidates = FindIndexedCandidates(shortcut, indexPath);
-        if (indexedCandidates?.Count == 1)
+        var candidates = FindCandidates(shortcut);
+        if (candidates.Count != 1)
         {
-            var indexed = indexedCandidates[0];
-            Console.WriteLine($"MATCH\t{Encode(indexed.Id)}\t{Encode(indexed.DisplayName)}");
+            Console.WriteLine("EXECUTABLE");
             return 0;
         }
 
-        var candidates = FindCandidates(shortcut);
-        if (candidates.Count != 1)
-            return 2;
-
         var entry = candidates[0];
+        // The index is only a performance hint. It must never make a stale
+        // entry look uninstallable after the program has been removed.
+        if (indexedCandidates?.Count == 1 &&
+            !string.Equals(indexedCandidates[0].Id, entry.GetCacheId(), StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("EXECUTABLE");
+            return 0;
+        }
+
         // The tab-separated protocol keeps the Rust side dependency-free.
         Console.WriteLine($"MATCH\t{Encode(entry.GetCacheId())}\t{Encode(entry.DisplayName)}");
         return 0;
@@ -103,11 +116,8 @@ internal static class Program
 
     private static List<ApplicationUninstallerEntry> FindCandidates(string shortcut)
     {
-        var target = shortcut.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
-            ? WindowsTools.ResolveShortcut(shortcut)
-            : shortcut;
-        if (string.IsNullOrWhiteSpace(target) || !File.Exists(target))
-            return [];
+        var target = ResolveApplicationTarget(shortcut);
+        if (target is null) return [];
 
         var targetDirectory = Path.GetDirectoryName(target);
         if (string.IsNullOrWhiteSpace(targetDirectory))
@@ -132,8 +142,8 @@ internal static class Program
     private static List<IndexedEntry>? FindIndexedCandidates(string shortcut, string? indexPath)
     {
         if (string.IsNullOrWhiteSpace(indexPath) || !File.Exists(indexPath)) return null;
-        var target = ResolveShortcutTarget(shortcut);
-        if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) return null;
+        var target = ResolveApplicationTarget(shortcut);
+        if (target is null) return null;
         var targetDirectory = Path.GetDirectoryName(target);
         if (string.IsNullOrWhiteSpace(targetDirectory)) return null;
 
@@ -168,12 +178,39 @@ internal static class Program
         }
     }
 
-    private static string? ResolveShortcutTarget(string shortcut)
+    private static string? ResolveApplicationTarget(string path)
     {
-        var target = shortcut.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
-            ? WindowsTools.ResolveShortcut(shortcut)
-            : shortcut;
-        return string.IsNullOrWhiteSpace(target) ? null : target;
+        try
+        {
+            var current = Path.GetFullPath(path);
+            if (current.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                return File.Exists(current) ? current : null;
+            if (!current.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) return null;
+
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var hop = 0; hop < MaxShortcutResolutionHops; hop++)
+            {
+                // Reject a missing link and any loop such as A.lnk -> B.lnk -> A.lnk.
+                if (!File.Exists(current) || !visited.Add(current)) return null;
+
+                var target = WindowsTools.ResolveShortcut(current);
+                if (string.IsNullOrWhiteSpace(target)) return null;
+                current = Path.GetFullPath(target);
+
+                if (current.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) continue;
+                return File.Exists(current) && Path.GetExtension(current).Equals(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? current
+                    : null;
+            }
+
+            // Do not follow arbitrarily deep chains; they are unlikely to be
+            // intentional application shortcuts and are unsafe to classify.
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static void ConfigureBcu()

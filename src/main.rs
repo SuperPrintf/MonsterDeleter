@@ -19,6 +19,8 @@ use std::{
 };
 
 use image::{imageops::FilterType, RgbaImage};
+use regex::Regex;
+use serde_json::{json, Value};
 use windows::{
     core::{Interface, Result, PCWSTR, PWSTR},
     Win32::{
@@ -54,7 +56,8 @@ use windows::{
             Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS},
             Shell::{
                 IShellLinkW, SHFileOperationW, ShellExecuteW, ShellLink, FOF_ALLOWUNDO,
-                FOF_NOCONFIRMATION, FOF_NOERRORUI, FO_DELETE, SHFILEOPSTRUCTW,
+                FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION, FOF_NOERRORUI, FO_DELETE,
+                SHFILEOPSTRUCTW,
             },
             WindowsAndMessaging::{
                 CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
@@ -126,6 +129,37 @@ struct InstalledApp {
 struct BcuCandidate {
     id: String,
     display_name: String,
+}
+
+enum BcuProbe {
+    Candidate(BcuCandidate),
+    ExecutableWithoutUninstaller,
+    NotExecutableShortcut,
+}
+
+const DEFAULT_UNINSTALL_TARGET_PATTERNS: [&str; 2] = [
+    r"(?i)^.*\.lnk$",
+    r"(?i)^.*\.exe$",
+];
+
+#[derive(Clone)]
+struct UninstallConfig {
+    enabled: bool,
+    mode: String,
+    target_patterns: Vec<String>,
+}
+
+impl Default for UninstallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: "official".to_owned(),
+            target_patterns: DEFAULT_UNINSTALL_TARGET_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+        }
+    }
 }
 
 impl Sprite {
@@ -359,7 +393,7 @@ struct OverlayApp {
     audio: Audio,
     error: Option<String>,
     uninstall_candidate: Option<BcuCandidate>,
-    uninstall_probe: Option<Receiver<Option<BcuCandidate>>>,
+    uninstall_probe: Option<Receiver<BcuProbe>>,
 }
 
 impl OverlayApp {
@@ -495,8 +529,7 @@ impl OverlayApp {
             }
             Phase::Ask => {
                 if self.choice_rects().iter().any(|rect| rect.contains(x, y)) {
-                    if uninstall_feature_enabled() {
-                        self.begin_uninstall_probe();
+                    if uninstall_feature_enabled() && self.begin_uninstall_probe() {
                         self.enter(Phase::DetectUninstall);
                     } else {
                         self.enter(Phase::Kick);
@@ -507,16 +540,24 @@ impl OverlayApp {
                 let choices = self.choice_rects();
                 if choices[0].contains(x, y) {
                     if let Some(app) = self.uninstall_candidate.as_ref() {
-                        match launch_bcu_uninstaller(
-                            &self.target,
-                            &app.id,
-                            uninstall_silent_execution_enabled(),
-                        ) {
-                            Ok(()) => self.enter(Phase::Fly),
-                            Err(error) => {
-                                self.error = Some(format!("无法启动 {} 的官方卸载程序：{error}", app.display_name));
-                                self.enter(Phase::Error);
+                        // Probe and launch always operate on the resolved executable.
+                        // Keep `self.target` untouched: it is the exact file the user
+                        // selected and is the only path that the recycle action may use.
+                        if let Some(executable) = uninstall_probe_target(&self.target) {
+                            match launch_bcu_uninstaller(
+                                &executable,
+                                &app.id,
+                                uninstall_silent_execution_enabled(),
+                            ) {
+                                Ok(()) => self.enter(Phase::Fly),
+                                Err(error) => {
+                                    self.error = Some(format!("无法启动 {} 的官方卸载程序：{error}", app.display_name));
+                                    self.enter(Phase::Error);
+                                }
                             }
+                        } else {
+                            self.error = Some("无法重新解析该软件的可执行文件".to_owned());
+                            self.enter(Phase::Error);
                         }
                     } else {
                         self.enter(Phase::Kick);
@@ -636,19 +677,21 @@ impl OverlayApp {
                 let result = self.uninstall_probe.as_ref().and_then(|receiver| match receiver.try_recv() {
                     Ok(result) => Some(result),
                     Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(None),
+                    Err(TryRecvError::Disconnected) => Some(BcuProbe::NotExecutableShortcut),
                 });
-                if let Some(candidate) = result {
+                if let Some(result) = result {
                     self.uninstall_probe = None;
-                    self.uninstall_candidate = candidate;
-                    self.enter(if self.uninstall_candidate.is_some() {
-                        Phase::UninstallAsk
-                    } else {
-                        // Do not silently turn an attempted software uninstall
-                        // into a shortcut deletion. The user must explicitly
-                        // choose that fallback after BCU could not verify it.
-                        Phase::UninstallUnavailable
-                    });
+                    self.uninstall_candidate = None;
+                    match result {
+                        BcuProbe::Candidate(candidate) => {
+                            self.uninstall_candidate = Some(candidate);
+                            self.enter(Phase::UninstallAsk);
+                        }
+                        // The shortcut does launch an executable, but Windows
+                        // has no safe official uninstaller association for it.
+                        BcuProbe::ExecutableWithoutUninstaller => self.enter(Phase::UninstallUnavailable),
+                        BcuProbe::NotExecutableShortcut => self.enter(Phase::Kick),
+                    }
                 }
             }
             Phase::Kick => {
@@ -667,15 +710,28 @@ impl OverlayApp {
         }
         self.render();
     }
-    fn begin_uninstall_probe(&mut self) {
+    fn begin_uninstall_probe(&mut self) -> bool {
         let target = self.target.clone();
-        let bridge = resource_dir().join("assets").join("tools").join("bcu-bridge").join("bcu-bridge.exe");
+        if !uninstall_target_matches_config(&target) {
+            return false;
+        }
+        let Some(probe_target) = uninstall_probe_target(&target) else {
+            return false;
+        };
+        let bridge = bcu_bridge_path();
+        // The overlay must never enter uninstall detection for folders, normal
+        // files, or a missing bridge. `probe_target` is always a verified exe,
+        // while `target` remains the original file selected for deletion.
+        if !bridge.is_file() {
+            return false;
+        }
         let index = uninstall_index_path();
         let (sender, receiver) = sync_channel(1);
         thread::spawn(move || {
-            let _ = sender.send(probe_bcu_shortcut(&bridge, &target, &index));
+            let _ = sender.send(probe_bcu_executable(&bridge, &probe_target, &index));
         });
         self.uninstall_probe = Some(receiver);
+        true
     }
     fn trigger_delete(&mut self) {
         self.deletion_started = true;
@@ -964,9 +1020,9 @@ impl OverlayApp {
         // per-monitor scale is applied once here, together with the monster.
         let bubble_w = self.px(220);
         let bubble_h = if message.contains('\n') {
-            self.px(112)
+            self.px(80)
         } else {
-            self.px(92)
+            self.px(64)
         };
         let margin = self.px(28);
         let tail = self.px(15);
@@ -1146,10 +1202,10 @@ impl OverlayApp {
                         } else {
                             ("居然是软件，\n需要卸载吗？", "卸载", "就删除快捷方式好啦")
                         }
-                    } else if self.phase == Phase::UninstallUnavailable {
-                        ("没有查到可用的\n官方卸载器", "删除", "取消")
                     } else if self.phase == Phase::DetectUninstall {
                         ("让我查查这是什么……", "", "")
+                    } else if self.phase == Phase::UninstallUnavailable {
+                        ("这个软件只能删除，\n无法卸载", "只删除", "取消")
                     } else {
                         ("喂，是这个吗？", "是的", "嘤嘤嘤就是这个")
                     };
@@ -1411,7 +1467,10 @@ fn recycle(target: &Path, elevated: bool) -> Result<()> {
         let mut operation = SHFILEOPSTRUCTW {
             wFunc: FO_DELETE,
             pFrom: PCWSTR(from.as_ptr()),
-            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI).0 as u16,
+            // Do not let the legacy Shell API follow a .lnk's connected
+            // target. Only the exact parsing path supplied by the context
+            // menu may be moved to the Recycle Bin.
+            fFlags: (FOF_ALLOWUNDO | FOF_NO_CONNECTED_ELEMENTS | FOF_NOCONFIRMATION | FOF_NOERRORUI).0 as u16,
             ..Default::default()
         };
         let status = SHFileOperationW(&mut operation);
@@ -1484,7 +1543,29 @@ fn installed_app_for_shortcut(shortcut: &Path) -> Option<InstalledApp> {
     (matches.len() == 1).then(|| matches.remove(0))
 }
 
+const MAX_SHORTCUT_RESOLUTION_HOPS: usize = 4;
+
 fn shortcut_target(shortcut: &Path) -> Option<PathBuf> {
+    if !is_shortcut_file(shortcut) {
+        return None;
+    }
+    let mut current = shortcut.to_path_buf();
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..MAX_SHORTCUT_RESOLUTION_HOPS {
+        if !current.is_file() || !visited.insert(current.clone()) {
+            return None;
+        }
+        let target = shortcut_target_once(&current)?;
+        if is_shortcut_file(&target) {
+            current = target;
+        } else {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn shortcut_target_once(shortcut: &Path) -> Option<PathBuf> {
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let result = (|| {
@@ -1716,39 +1797,70 @@ fn bcu_bridge_path() -> PathBuf {
         .join("bcu-bridge.exe")
 }
 
-fn probe_bcu_shortcut(bridge: &Path, shortcut: &Path, index: &Path) -> Option<BcuCandidate> {
-    if !bridge.is_file()
-        || !shortcut
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
-    {
-        return None;
+fn probe_bcu_executable(bridge: &Path, executable: &Path, index: &Path) -> BcuProbe {
+    if !bridge.is_file() || !executable.is_file() || !is_executable_file(executable) {
+        return BcuProbe::NotExecutableShortcut;
     }
-    let output = Command::new(bridge)
+    let Ok(output) = Command::new(bridge)
         .arg("resolve")
-        .arg(shortcut)
+        .arg(executable)
         .arg(index)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .ok()?;
+    else {
+        return BcuProbe::NotExecutableShortcut;
+    };
     if !output.status.success() {
-        return None;
+        return BcuProbe::NotExecutableShortcut;
     }
     let output_text = String::from_utf8_lossy(&output.stdout);
     let mut fields = output_text.trim().split('\t');
-    (fields.next()? == "MATCH").then_some(())?;
-    let id = fields.next()?.trim();
-    let display_name = fields.next()?.trim();
-    if id.is_empty() || display_name.is_empty() || fields.next().is_some() {
-        return None;
+    match fields.next() {
+        Some("EXECUTABLE") if fields.next().is_none() => BcuProbe::ExecutableWithoutUninstaller,
+        Some("MATCH") => {
+            let Some(id) = fields.next().map(str::trim) else {
+                return BcuProbe::NotExecutableShortcut;
+            };
+            let Some(display_name) = fields.next().map(str::trim) else {
+                return BcuProbe::NotExecutableShortcut;
+            };
+            if id.is_empty() || display_name.is_empty() || fields.next().is_some() {
+                return BcuProbe::NotExecutableShortcut;
+            }
+            let Some(display_name) = base64_decode(display_name)
+                .and_then(|value| String::from_utf8(value).ok())
+            else {
+                return BcuProbe::NotExecutableShortcut;
+            };
+            BcuProbe::Candidate(BcuCandidate {
+                id: id.to_owned(),
+                display_name,
+            })
+        }
+        _ => BcuProbe::NotExecutableShortcut,
     }
-    Some(BcuCandidate {
-        id: id.to_owned(),
-        display_name: String::from_utf8(base64_decode(display_name)?).ok()?,
-    })
 }
 
-fn launch_bcu_uninstaller(shortcut: &Path, candidate_id: &str, quiet: bool) -> Result<()> {
+fn is_shortcut_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
+fn uninstall_probe_target(target: &Path) -> Option<PathBuf> {
+    let executable = if is_shortcut_file(target) {
+        shortcut_target(target)?
+    } else {
+        target.to_path_buf()
+    };
+    (executable.is_file() && is_executable_file(&executable)).then_some(executable)
+}
+
+fn launch_bcu_uninstaller(executable: &Path, candidate_id: &str, quiet: bool) -> Result<()> {
     let bridge = bcu_bridge_path();
     if !bridge.is_file() {
         return Err(windows::core::Error::from_thread());
@@ -1756,7 +1868,7 @@ fn launch_bcu_uninstaller(shortcut: &Path, candidate_id: &str, quiet: bool) -> R
     let mut command = Command::new(bridge);
     command
         .arg("uninstall")
-        .arg(shortcut)
+        .arg(executable)
         .arg(candidate_id)
         .creation_flags(CREATE_NO_WINDOW);
     if quiet {
@@ -1808,51 +1920,120 @@ fn resource_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn user_config_path() -> PathBuf {
+fn user_config_directory() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| resource_dir())
         .join("MonsterDeleter")
-        .join("config.toml")
+}
+
+fn user_config_path() -> PathBuf {
+    user_config_directory().join("config.json")
+}
+
+fn legacy_user_config_path() -> PathBuf {
+    user_config_directory().join("config.toml")
 }
 
 fn uninstall_index_path() -> PathBuf {
-    user_config_path().with_file_name("uninstall-index.tsv")
+    user_config_directory().join("uninstall-index.tsv")
 }
 
 fn uninstall_feature_enabled() -> bool {
-    fs::read_to_string(user_config_path())
-        .ok()
-        .is_none_or(|contents| !contents.contains("enabled = false"))
+    read_uninstall_config().enabled
 }
 
 fn uninstall_silent_execution_enabled() -> bool {
-    uninstall_feature_enabled()
-        && fs::read_to_string(user_config_path()).ok().is_some_and(|contents| {
-            contents.contains("mode = \"silent\"") || contents.contains("mode = \"force_silent\"")
-        })
+    let config = read_uninstall_config();
+    config.enabled && matches!(config.mode.as_str(), "silent" | "force_silent")
 }
 
 fn write_user_config(uninstall_enabled: bool, silent_execution: bool) -> std::io::Result<()> {
+    let mut config = read_uninstall_config();
+    config.enabled = uninstall_enabled;
+    config.mode = if uninstall_enabled && silent_execution {
+        "silent".to_owned()
+    } else {
+        "official".to_owned()
+    };
+    write_uninstall_config(&config)
+}
+
+fn write_uninstall_config(config: &UninstallConfig) -> std::io::Result<()> {
     let path = user_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mode = if uninstall_enabled && silent_execution { "silent" } else { "official" };
-    fs::write(
-        path,
-        format!(
-            "# MonsterDeleter 用户配置（可直接用记事本修改）\n\
-[uninstall]\n\
-enabled = {uninstall_enabled}\n\
-# enabled = false: 直接执行小怪兽删除，不显示软件卸载询问\n\
-# official: 使用软件自身的正常卸载界面\n\
-# silent: 卸载功能静默执行；仍可能显示 UAC 或厂商窗口\n\
-mode = \"{mode}\"\n\
-# 默认不扫描或清理残留项\n\
-cleanup_after_uninstall = false\n"
-        ),
-    )
+    let document = json!({
+        "uninstall": {
+            "enabled": config.enabled,
+            "mode": config.mode,
+            "target_patterns": config.target_patterns,
+            "cleanup_after_uninstall": false,
+        }
+    });
+    let contents = serde_json::to_string_pretty(&document)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, format!("{contents}\n"))
+}
+
+fn read_uninstall_config() -> UninstallConfig {
+    if let Ok(contents) = fs::read_to_string(user_config_path()) {
+        if let Ok(document) = serde_json::from_str::<Value>(&contents) {
+            let uninstall = document.get("uninstall").and_then(Value::as_object);
+            let mut config = UninstallConfig::default();
+            if let Some(uninstall) = uninstall {
+                config.enabled = uninstall
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(config.enabled);
+                config.mode = uninstall
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&config.mode)
+                    .to_owned();
+                if let Some(patterns) = uninstall.get("target_patterns").and_then(Value::as_array) {
+                    config.target_patterns = patterns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                }
+            }
+            return config;
+        }
+    }
+
+    let legacy = fs::read_to_string(legacy_user_config_path()).ok();
+    let Some(legacy) = legacy else {
+        return UninstallConfig::default();
+    };
+    let config = UninstallConfig {
+        enabled: !legacy.contains("enabled = false"),
+        mode: if legacy.contains("mode = \"silent\"") || legacy.contains("mode = \"force_silent\"") {
+            "silent".to_owned()
+        } else {
+            "official".to_owned()
+        },
+        ..Default::default()
+    };
+    let _ = write_uninstall_config(&config);
+    config
+}
+
+fn uninstall_target_matches_config(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches_uninstall_patterns(name, &read_uninstall_config().target_patterns)
+}
+
+fn matches_uninstall_patterns(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        Regex::new(pattern)
+            .ok()
+            .is_some_and(|regex| regex.is_match(name))
+    })
 }
 
 fn show_settings() -> Result<()> {
@@ -1921,7 +2102,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_decode, parse_uninstall_command, recycle_failure_code, DE_ACCESSDENIEDSRC};
+    use super::{base64_decode, is_executable_file, is_shortcut_file, matches_uninstall_patterns, parse_uninstall_command, recycle_failure_code, DE_ACCESSDENIEDSRC};
+    use std::path::Path;
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_CANCELLED};
 
     #[test]
@@ -1954,5 +2136,22 @@ mod tests {
         );
         assert_eq!(recycle_failure_code(0, true), Some(ERROR_CANCELLED));
         assert_eq!(recycle_failure_code(0, false), None);
+    }
+
+    #[test]
+    fn only_lnk_files_are_considered_for_uninstall_detection() {
+        assert!(is_shortcut_file(Path::new("app.LNK")));
+        assert!(!is_shortcut_file(Path::new("app.exe")));
+        assert!(!is_shortcut_file(Path::new("folder")));
+        assert!(is_executable_file(Path::new("app.EXE")));
+        assert!(!is_executable_file(Path::new("app.lnk")));
+    }
+
+    #[test]
+    fn configured_patterns_choose_uninstall_probe_targets() {
+        let patterns = vec![r"(?i)^.*\.lnk$".to_owned(), r"(?i)^.*\.exe$".to_owned()];
+        assert!(matches_uninstall_patterns("Quota Float.LNK", &patterns));
+        assert!(matches_uninstall_patterns("quota-float.exe", &patterns));
+        assert!(!matches_uninstall_patterns("notes.txt", &patterns));
     }
 }
