@@ -1,52 +1,40 @@
 # MonsterDeleter（小怪兽删除器）
 
-> **下载最新 Windows x64 安装包：** [MonsterDeleter-Setup-1.0.17.exe](https://github.com/SuperPrintf/MonsterDeleter/releases/download/v1.0.17/MonsterDeleter-Setup-1.0.17.exe)
+> **最新 Windows x64 安装包：** [MonsterDeleter-Setup-1.1.0.exe](https://github.com/SuperPrintf/MonsterDeleter/releases/download/v1.1.0/MonsterDeleter-Setup-1.1.0.exe)
 >
-> **选择历史版本：** [GitHub Releases](https://github.com/SuperPrintf/MonsterDeleter/releases)
+> **历史版本与校验信息：** [GitHub Releases](https://github.com/SuperPrintf/MonsterDeleter/releases)
 
-MonsterDeleter 是一个 Windows 10/11 桌面端趣味删除工具：在资源管理器中右键点击文件、文件夹或快捷方式，选择“小怪兽删除”，小怪兽便会跑到目标旁确认并将选中的对象放入回收站。项目保留原始素材的动画、气泡按钮和音效体验，以 Rust 和原生 Win32 重新实现。
+MonsterDeleter 是一个面向 Windows 10/11 的桌面删除工具。在资源管理器中右键文件、文件夹或快捷方式，选择“召唤小怪兽删除”，小怪兽会完成选点、进场、确认、爆炸和回收站删除的整套动画。它保留了原项目的怪兽素材、气泡、按钮和音效，并以 Rust 与原生 Win32 API 重构。
 
-安装需要管理员权限，以便为全部用户注册资源管理器右键菜单；卸载可在控制面板的“程序和功能”中完成。
+安装需要管理员权限，以便为全部用户注册资源管理器右键入口；卸载可在“控制面板 → 程序和功能”中完成。
+
+## v1.1.0 重点更新
+
+- 多选入口改为 Explorer COM 选区回调：一次获取完整选中项目，消除原先按文件启动、延时合并造成的启动迟缓和漏项。
+- 多目标且未命中卸载功能时，只播放一次怪兽确认动画，并将所有原始选中项作为一个回收站操作处理。
+- 多个可卸载目标会提供“逐一指定”或“全部卸载”分支；逐一模式使用准星高亮、固定叉标记和独立确认。
+- 安装包包含新的资源管理器命令 DLL，并在升级时清理旧的逐文件引导器。
 
 ## 功能
 
-- 右键菜单支持普通文件、文件夹和 `.lnk` 快捷方式。
-- 半透明、逐像素透明的选择层，不遮挡桌面；红色准星跟随鼠标，`Esc` 可随时取消。
-- 保留小怪兽进场、指向、气泡、确认按钮和对应音效；针对屏幕边缘、多显示器自动调整布局。
-- 删除使用回收站语义，不调用 Windows 原生删除确认框。权限不足时先询问，再经 UAC 提权重试。
-- 可选“卸载功能”：对符合规则且确实关联到已安装应用的 `.lnk` 或 `.exe`，展示第二层“小怪兽”询问，并仅启动该软件登记的官方卸载程序。
-- 快捷方式解析支持 `.lnk → .lnk → .exe` 嵌套（最多 4 层，带循环保护）；无可用卸载程序时只允许“只删除”或“取消”。回收时始终处理用户选中的原始快捷方式，绝不删除其指向的可执行文件。
-- 可选“卸载功能静默执行”：尽量向官方卸载程序传递静默参数；UAC 或厂商窗口仍可能出现。
+- 支持文件、文件夹和 `.lnk` 快捷方式；快捷方式删除始终作用于 `.lnk` 本身，不会误删其指向的程序。
+- 全屏覆盖层采用逐像素 Alpha 合成，未绘制区域保持透明；选点阶段使用原始准星贴图，按 `Esc` 可随时取消。
+- 适配多显示器、DPI 与屏幕边缘：怪兽、气泡与按钮会在目标附近自动调整位置和朝向。
+- 删除使用回收站语义，不调用 Windows 原生删除确认窗口；权限不足时会询问并允许通过 UAC 提权重试。
+- 可选的软件卸载识别：仅当目标符合规则、能解析到有效程序且能在已安装软件索引中确认时，才进入第二层卸载询问。
+- 卸载执行由受限桥接器调用软件自身登记的卸载程序；可选择“卸载功能静默执行”。
 
-## 程序结构与核心逻辑
+## 多目标与卸载逻辑
 
-```text
-src/main.rs                    Rust/Win32 分层透明窗口、状态机、动画及回收站逻辑
-assets/                        怪兽帧、气泡、准星、音效、程序图标
-tools/bcu-bridge/              受限的卸载识别桥接器，只解析已安装应用的官方卸载记录
-installer/MonsterDeleter.iss   Inno Setup 安装、卸载和右键菜单注册
-docs/config.example.json       卸载功能配置示例
-build-installer.ps1            构建桥接器、主程序并封装 Windows 安装包
-dist/                          本地生成的版本化安装包（不提交源码仓库）
-platforms/                     将来 macOS/Linux 平台适配预留
-```
+1. Explorer 将一次右键操作的完整选区传递给程序，程序只创建一个主动画流程。
+2. 首轮气泡会询问“喂，是这些吗？”。按 `Esc` 或“取消”会终止本次操作。
+3. 未启用卸载功能、没有可验证卸载项，或用户选择只删除时：所有原始选中项会作为一个批量操作放入回收站，并在每个可见目标位置绘制独立爆炸效果。
+4. 单一可卸载目标：删除其它项目后，对该目标显示卸载询问。
+5. 多个可卸载目标：可选择一次全部卸载，或使用准星逐一选择；每确认一个目标，界面会保留叉标记，最后再批量启动所选软件的官方卸载程序。
 
-交互由有限状态机驱动：
+## 配置
 
-```text
-选择目标 → 透明选点层 → 怪兽进场/确认
-                              ├─ 普通对象：删除动画 → 回收站
-                              └─ 符合卸载规则的 .lnk/.exe：核验已安装应用
-                                     ├─ 找到官方卸载程序：询问“需要卸载吗？”
-                                     ├─ 仅识别到程序：询问“只能删除，无法卸载”
-                                     └─ 非软件或不匹配：直接使用普通删除流程
-```
-
-选择层采用 Win32 分层窗口和 Alpha 合成；未绘制区域完全透明。卸载识别与启动使用解析后的 `.exe`，但删除步骤始终使用用户原始选择路径，因此不会把“删除快捷方式”错误变成“删除快捷方式指向的程序”。
-
-## 配置卸载识别
-
-安装后配置位于：`%LOCALAPPDATA%\MonsterDeleter\config.json`。完整示例见 [docs/config.example.json](docs/config.example.json)。
+安装后配置文件位于：`%LOCALAPPDATA%\MonsterDeleter\config.json`。也可从开始菜单的“Monster Deleter 设置”打开简易设置窗口。
 
 ```json
 {
@@ -57,47 +45,59 @@ platforms/                     将来 macOS/Linux 平台适配预留
       "(?i)^.*\\.lnk$",
       "(?i)^.*\\.exe$"
     ],
+    "batch_target_patterns": [
+      "(?i)^.*\\.lnk$"
+    ],
     "cleanup_after_uninstall": false
   }
 }
 ```
 
-- `enabled`：是否启用删除确认后的二阶段卸载询问。
-- `mode`：当前仅支持安全的 `official` 模式，即启动登记的官方卸载程序。
-- `target_patterns`：匹配**文件名**的 Rust 正则表达式数组。默认覆盖 `.lnk` 与 `.exe`；例如仅检查快捷方式时可保留 `(?i)^.*\.lnk$`。
-- `cleanup_after_uninstall`：预留项，当前保持 `false`，不会删除卸载后残留内容。
+- `enabled`：是否在删除确认后启用软件卸载识别。
+- `mode`：`official` 使用常规官方卸载流程；`silent` 表示尽可能传递静默参数，但仍可能显示 UAC 或厂商窗口。
+- `target_patterns`：单目标卸载识别的 Rust 正则数组，默认匹配 `.lnk` 和 `.exe`。
+- `batch_target_patterns`：多选时参与卸载识别的正则数组；默认仅 `.lnk`，避免普通文档、文件夹或可执行文件被意外纳入卸载流程。
+- `cleanup_after_uninstall`：预留项，当前固定为 `false`，不会清理软件残留文件。
 
-规则只决定哪些目标需要尝试卸载识别；即使匹配规则，程序也必须解析为有效 `.exe` 并关联到已安装应用，才会显示卸载询问。
+正则只决定哪些项目可参与检测；仍需解析到有效 `.exe`，并与已安装程序索引唯一匹配，才会触发卸载询问。
+
+## 项目结构
+
+```text
+src/main.rs                    Win32 分层透明窗口、状态机、动画、音频、回收站与卸载流程
+src/shell_extension.rs         Explorer IExecuteCommand COM 入口，接收完整多选数组
+assets/                        怪兽、气泡、准星、音效和程序图标
+tools/bcu-bridge/              受限卸载桥接器及其 BCUninstaller 许可信息
+installer/MonsterDeleter.iss   Inno Setup 安装、卸载、COM 注册与右键菜单
+docs/config.example.json       配置文件示例
+build-installer.ps1            构建桥接器、Rust 程序和安装包
+dist/                          本地生成的安装包（不提交源码仓库）
+platforms/                     预留的 Windows / Linux / macOS 平台目录
+```
 
 ## 编译
 
-### 环境
-
-- Windows 10 或 11 x64
-- [Rust stable（MSVC 工具链）](https://www.rust-lang.org/tools/install)
-- .NET 8 SDK（构建卸载桥接器）
-- [Inno Setup 6](https://jrsoftware.org/isinfo.php)（构建安装包）
-- PowerShell 5.1 或更高版本
-
-### 主程序
+环境要求：Windows 10/11 x64、Rust stable（MSVC 工具链）、.NET 8 SDK、Inno Setup 6 和 PowerShell 5.1+。
 
 ```powershell
-cargo test --offline
-cargo build --release
+cargo test --offline --lib --bins
+cargo build --release --lib --bins
 ```
 
-输出：`target\release\monster-deleter.exe`。
-
-### 安装包
+构建完整安装包：
 
 ```powershell
 .\build-installer.ps1
 ```
 
-脚本会先发布自包含的卸载桥接器，再构建 Rust 主程序并调用 Inno Setup。输出位于 `dist\MonsterDeleter-Setup-<版本号>.exe`。
+如桥接器未变化且本地已有 `assets\tools\bcu-bridge\bcu-bridge.exe`，可在离线环境中复用它：
+
+```powershell
+.\build-installer.ps1 -SkipBridgeBuild
+```
+
+输出位于 `dist\MonsterDeleter-Setup-<版本号>.exe`。
 
 ## 发布与历史版本
 
-源码仓库不提交安装包。每次正式发行都创建一个 Git 标签和对应的 GitHub Release，并将当次版本的 `MonsterDeleter-Setup-<版本号>.exe` 作为 Release 附件上传。旧 Release 与旧附件保持不变，因此用户可在 [Releases 页面](https://github.com/SuperPrintf/MonsterDeleter/releases) 按版本下载，而不会被新版本覆盖。
-
-`platforms/windows`、`platforms/linux` 和 `platforms/macos` 为后续跨平台适配预留；动画状态机与业务策略会逐步下沉为平台无关的 Rust 核心。
+安装包不提交到 Git 仓库。每个正式版本都创建独立 Git 标签与 GitHub Release，并将对应安装包作为 Release 附件上传；旧版本不会被覆盖，用户可在 [Releases](https://github.com/SuperPrintf/MonsterDeleter/releases) 页面选择下载。

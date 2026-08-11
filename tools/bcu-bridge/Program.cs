@@ -24,6 +24,7 @@ internal static class Program
                 "index" when args.Length == 2 => BuildIndex(args[1]),
                 "resolve" when args.Length is 2 or 3 => Resolve(args[1], args.ElementAtOrDefault(2)),
                 "uninstall" when args.Length is 3 or 4 => Uninstall(args[1], args[2], args.Skip(3).Any(x => x == "--quiet")),
+                "uninstall-batch" when args.Length >= 3 => UninstallBatch(args.Skip(1).ToArray()),
                 _ => InvalidArguments(),
             };
         }
@@ -111,6 +112,47 @@ internal static class Program
         // `quiet` only selects a quiet command supplied or derived by BCU. The
         // wrapper never passes /U, /J, force-removal, or any cleanup operation.
         candidates[0].RunUninstaller(quiet, simulate: false);
+        return 0;
+    }
+
+    private static int UninstallBatch(string[] arguments)
+    {
+        var quiet = arguments.Contains("--quiet", StringComparer.Ordinal);
+        var pairs = arguments.Where(argument => argument != "--quiet").ToArray();
+        if (pairs.Length == 0 || pairs.Length % 2 != 0) return 1;
+
+        var requests = new List<(string Target, string Id)>();
+        for (var i = 0; i < pairs.Length; i += 2)
+        {
+            var target = ResolveApplicationTarget(pairs[i]);
+            if (target is null) return 2;
+            requests.Add((target, Decode(pairs[i + 1])));
+        }
+
+        ConfigureBcu();
+        var entries = new RegistryFactory(MsiTools.MsiEnumProducts()).GetUninstallerEntries(_ => { })
+            .Where(entry => entry.UninstallPossible && !entry.SystemComponent)
+            .Where(entry => entry.UninstallerKind != UninstallerType.SimpleDelete)
+            .ToList();
+        var selected = new List<ApplicationUninstallerEntry>();
+        foreach (var request in requests)
+        {
+            var directory = Path.GetDirectoryName(request.Target);
+            if (string.IsNullOrWhiteSpace(directory)) return 2;
+            var candidates = entries.Where(entry =>
+                    string.Equals(entry.GetCacheId(), request.Id, StringComparison.Ordinal) &&
+                    MatchesShortcutTarget(entry, request.Target, directory))
+                .ToList();
+            if (candidates.Count != 1) return 2;
+            selected.Add(candidates[0]);
+        }
+
+        // Different shortcuts can point to the same app.  Run its official
+        // uninstaller once; no BCU force-removal or residual cleanup is used.
+        foreach (var entry in selected
+                     .GroupBy(entry => entry.GetCacheId(), StringComparer.OrdinalIgnoreCase)
+                     .Select(group => group.First()))
+            entry.RunUninstaller(quiet, simulate: false);
         return 0;
     }
 
@@ -264,7 +306,7 @@ internal static class Program
 
     private static int InvalidArguments()
     {
-        Console.Error.WriteLine("Usage: bcu-bridge index <cache-path> | resolve <shortcut> [cache-path] | uninstall <shortcut> <candidate-id> [--quiet]");
+        Console.Error.WriteLine("Usage: bcu-bridge index <cache-path> | resolve <target> [cache-path] | uninstall <target> <candidate-id> [--quiet] | uninstall-batch [--quiet] <target> <candidate-id> [...]");
         return 1;
     }
 }

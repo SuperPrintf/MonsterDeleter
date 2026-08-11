@@ -1,6 +1,7 @@
 #define AppName "Monster Deleter"
-#define AppVersion "1.0.17"
+#define AppVersion "1.1.0"
 #define AppExeName "monster-deleter.exe"
+#define ShellDllName "monster_deleter_shell.dll"
 
 [Setup]
 AppId={{1F5473BE-201D-4F5E-ABB3-3FA0D679C083}
@@ -26,6 +27,7 @@ Name: "uninstall_silent_execution"; Description: "卸载功能静默执行（可
 
 [Files]
 Source: "..\target\release\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\{#ShellDllName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\docs\安装与卸载说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -36,18 +38,31 @@ Filename: "notepad.exe"; Parameters: """{app}\安装与卸载说明.txt"""; Flag
 [Icons]
 Name: "{group}\Monster Deleter 设置"; Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; WorkingDir: "{app}"
 
+[InstallDelete]
+; Remove the obsolete per-file entry point on upgrades.  The COM selection
+; handler receives the complete Explorer selection in one invocation.
+Type: files; Name: "{app}\monster-deleter-bootstrap.exe"
+
 [Registry]
 Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
-Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
+; DelegateExecute invokes the COM command once with the full Explorer
+; selection, avoiding per-file launches and any time-window aggregation.
+Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKLM; Subkey: "Software\Classes\*\shell\MonsterDeleter\command"; ValueType: string; ValueName: "DelegateExecute"; ValueData: "{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}"
 ; Explorer resolves %1 to a shortcut's target for wildcard verbs. Register the
 ; same verb on lnkfile so shortcut invocations receive the .lnk path itself.
 Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
-Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKLM; Subkey: "Software\Classes\lnkfile\shell\MonsterDeleter\command"; ValueType: string; ValueName: "DelegateExecute"; ValueData: "{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}"
 Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter"; ValueType: string; ValueName: ""; ValueData: "召唤小怪兽删除"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\branding\monster-head-v2.ico"
-Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKLM; Subkey: "Software\Classes\Directory\shell\MonsterDeleter\command"; ValueType: string; ValueName: "DelegateExecute"; ValueData: "{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}"
+Root: HKLM; Subkey: "Software\Classes\CLSID\{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}"; ValueType: string; ValueName: ""; ValueData: "Monster Deleter selection command"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\CLSID\{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}\InprocServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ShellDllName}"
+Root: HKLM; Subkey: "Software\Classes\CLSID\{{8C6932F1-4C2F-4F87-9F78-B563BC6DF3B1}\InprocServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Apartment"
 
 [Code]
 procedure SHChangeNotify(wEventId: Integer; uFlags: Cardinal; dwItem1, dwItem2: Integer);
@@ -81,6 +96,9 @@ begin
     '    "target_patterns": [' + #13#10 +
     '      "(?i)^.*\\.lnk$",' + #13#10 +
     '      "(?i)^.*\\.exe$"' + #13#10 +
+    '    ],' + #13#10 +
+    '    "batch_target_patterns": [' + #13#10 +
+    '      "(?i)^.*\\.lnk$"' + #13#10 +
     '    ],' + #13#10 +
     '    "cleanup_after_uninstall": false' + #13#10 +
     '  }' + #13#10 +

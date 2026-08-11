@@ -1,9 +1,16 @@
 [package]
 name = "monster-deleter"
-version = "1.0.17"
+version = "1.1.0"
 edition = "2021"
 description = "A consent-first Windows Recycle Bin helper with a playful monster theme."
 license = "MIT"
+
+[lib]
+# Explorer loads this small in-process COM entry only to obtain the complete
+# selection, then it starts the normal overlay executable out of process.
+name = "monster_deleter_shell"
+crate-type = ["cdylib"]
+path = "src/shell_extension.rs"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -17,6 +24,7 @@ windows = { version = "0.62", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Environment",
+  "Win32_System_LibraryLoader",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_Shell",
@@ -24,6 +32,8 @@ windows = { version = "0.62", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# `#[implement]` expands to this crate by name for the Explorer COM DLL.
+windows-core = "0.62"
 
 [profile.release]
 lto = true

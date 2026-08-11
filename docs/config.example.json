@@ -6,6 +6,9 @@
       "(?i)^.*\\.lnk$",
       "(?i)^.*\\.exe$"
     ],
+    "batch_target_patterns": [
+      "(?i)^.*\\.lnk$"
+    ],
     "cleanup_after_uninstall": false
   }
 }
