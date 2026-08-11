@@ -7,15 +7,16 @@
 use std::{
     env,
     fs,
+    net::UdpSocket,
     os::windows::ffi::OsStrExt,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     ptr::null_mut,
     slice,
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{sync_channel, Receiver, TryRecvError},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use image::{imageops::FilterType, RgbaImage};
@@ -25,8 +26,9 @@ use windows::{
     core::{Interface, Result, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
-            COLORREF, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_NO_MORE_ITEMS, HWND, LPARAM,
-            LRESULT, POINT, RECT, SIZE, WIN32_ERROR, WPARAM,
+            CloseHandle, COLORREF, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_NO_MORE_ITEMS,
+            HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_ABANDONED, WAIT_OBJECT_0,
+            WIN32_ERROR, WPARAM,
         },
         Graphics::Gdi::{
             CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC,
@@ -50,6 +52,7 @@ use windows::{
                 HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY,
                 KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
             },
+            Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
         },
         UI::{
             HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
@@ -78,6 +81,17 @@ use windows::{
 const FRAME_RATE: f32 = 8.0;
 const TICK_ID: usize = 1;
 const ESC_HOTKEY_ID: i32 = 0x4d44;
+// Explorer invokes a legacy verb once per selected item.  The first process
+// briefly owns this loopback endpoint and collects the sibling invocations,
+// so the overlay receives the complete selection exactly once.
+const SELECTION_BROKER_ADDR: &str = "127.0.0.1:39618";
+const SELECTION_BROKER_MAX_PACKET: usize = 60 * 1024;
+const SELECTION_BROKER_MUTEX: &str = "Local\\MonsterDeleter.SelectionBroker.v1";
+// Explorer can create legacy-verb processes one after another.  Keep a
+// bounded, stable collection window after the first valid path so a slow
+// sibling cannot be dropped from the same selection transaction.
+const SELECTION_BROKER_COLLECTION_WINDOW: Duration = Duration::from_secs(1);
+const SELECTION_BROKER_MAX_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -87,6 +101,8 @@ enum Phase {
     Point,
     Ask,
     DetectUninstall,
+    UninstallModeAsk,
+    SelectUninstallTarget,
     UninstallAsk,
     UninstallUnavailable,
     Kick,
@@ -127,6 +143,12 @@ struct InstalledApp {
 
 #[derive(Clone)]
 struct BcuCandidate {
+    /// Exact Explorer item selected by the user.  This is never replaced by
+    /// the resolved executable, so shortcut deletion cannot accidentally
+    /// recycle its target.
+    source: PathBuf,
+    /// Resolved executable used only by BCUninstaller matching/launching.
+    executable: PathBuf,
     id: String,
     display_name: String,
 }
@@ -141,12 +163,16 @@ const DEFAULT_UNINSTALL_TARGET_PATTERNS: [&str; 2] = [
     r"(?i)^.*\.lnk$",
     r"(?i)^.*\.exe$",
 ];
+const DEFAULT_BATCH_UNINSTALL_TARGET_PATTERNS: [&str; 1] = [r"(?i)^.*\.lnk$"];
 
 #[derive(Clone)]
 struct UninstallConfig {
     enabled: bool,
     mode: String,
     target_patterns: Vec<String>,
+    /// When several Explorer items are selected, only matching items enter
+    /// uninstall detection.  The conservative default is shortcuts only.
+    batch_target_patterns: Vec<String>,
 }
 
 impl Default for UninstallConfig {
@@ -158,8 +184,19 @@ impl Default for UninstallConfig {
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
+            batch_target_patterns: DEFAULT_BATCH_UNINSTALL_TARGET_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AfterKick {
+    FlyAway,
+    AskSingleUninstall,
+    SelectUninstallTarget,
 }
 
 impl Sprite {
@@ -376,7 +413,13 @@ struct OverlayApp {
     pixels: Vec<u8>,
     assets: PathBuf,
     background: Option<RgbaImage>,
-    target: PathBuf,
+    /// Exact paths received from Explorer.  Keep these separate from resolved
+    /// executables: a `.lnk` must never be replaced by its target for recycle.
+    targets: Vec<PathBuf>,
+    /// Items that still need to be moved to the Recycle Bin.  This is built as
+    /// the user answers the uninstall questions, then processed in one shell
+    /// operation and one monster sequence.
+    delete_targets: Vec<PathBuf>,
     phase: Phase,
     phase_started: Instant,
     target_cursor: HCURSOR,
@@ -389,15 +432,25 @@ struct OverlayApp {
     fly: Option<Sprite>,
     explosion: Option<Sprite>,
     explosion_started: Option<Instant>,
+    explosion_positions: Vec<(i32, i32)>,
     deletion_started: bool,
+    after_kick: AfterKick,
     audio: Audio,
     error: Option<String>,
-    uninstall_candidate: Option<BcuCandidate>,
-    uninstall_probe: Option<Receiver<BcuProbe>>,
+    uninstall_candidates: Vec<BcuCandidate>,
+    confirmed_uninstall_candidates: Vec<BcuCandidate>,
+    current_uninstall_candidate: usize,
+    /// A fixed cross is left at every point manually assigned to an
+    /// uninstallable item while the remaining items are selected.
+    uninstall_markers: Vec<(i32, i32)>,
+    uninstall_probe: Option<Receiver<Vec<(PathBuf, BcuProbe)>>>,
 }
 
 impl OverlayApp {
-    unsafe fn new(target: PathBuf) -> Option<Self> {
+    unsafe fn new(targets: Vec<PathBuf>) -> Option<Self> {
+        if targets.is_empty() {
+            return None;
+        }
         let mut cursor_point = POINT::default();
         GetCursorPos(&mut cursor_point).ok()?;
         let monitor = MonitorFromPoint(cursor_point, MONITOR_DEFAULTTONEAREST);
@@ -431,7 +484,8 @@ impl OverlayApp {
             pixels: vec![0; width as usize * height as usize * 4],
             assets: assets.clone(),
             background,
-            target,
+            targets,
+            delete_targets: Vec::new(),
             phase: Phase::Select,
             phase_started: Instant::now(),
             target_cursor: create_target_cursor().unwrap_or_default(),
@@ -444,10 +498,15 @@ impl OverlayApp {
             fly: None,
             explosion: None,
             explosion_started: None,
+            explosion_positions: Vec::new(),
             deletion_started: false,
+            after_kick: AfterKick::FlyAway,
             audio: Audio::new(&assets),
             error: None,
-            uninstall_candidate: None,
+            uninstall_candidates: Vec::new(),
+            confirmed_uninstall_candidates: Vec::new(),
+            current_uninstall_candidate: 0,
+            uninstall_markers: Vec::new(),
             uninstall_probe: None,
         })
     }
@@ -527,49 +586,62 @@ impl OverlayApp {
                 self.ensure_walk();
                 self.enter(Phase::FadeOut);
             }
+            Phase::SelectUninstallTarget => {
+                // The candidates are in a stable order.  A click binds the
+                // current one to a visual point and leaves a marker behind;
+                // it does not infer a position from Explorer's private view.
+                self.target_position = (x, y);
+                self.points_left = x < self.width / 2;
+                self.uninstall_markers.push((x, y));
+                unsafe { restore_default_cursor() };
+                self.ensure_point();
+                self.enter(Phase::Point);
+            }
             Phase::Ask => {
                 if self.choice_rects().iter().any(|rect| rect.contains(x, y)) {
                     if uninstall_feature_enabled() && self.begin_uninstall_probe() {
                         self.enter(Phase::DetectUninstall);
                     } else {
-                        self.enter(Phase::Kick);
+                        self.begin_direct_batch_recycle();
                     }
                 }
             }
             Phase::UninstallAsk => {
                 let choices = self.choice_rects();
                 if choices[0].contains(x, y) {
-                    if let Some(app) = self.uninstall_candidate.as_ref() {
-                        // Probe and launch always operate on the resolved executable.
-                        // Keep `self.target` untouched: it is the exact file the user
-                        // selected and is the only path that the recycle action may use.
-                        if let Some(executable) = uninstall_probe_target(&self.target) {
-                            match launch_bcu_uninstaller(
-                                &executable,
-                                &app.id,
-                                uninstall_silent_execution_enabled(),
-                            ) {
-                                Ok(()) => self.enter(Phase::Fly),
-                                Err(error) => {
-                                    self.error = Some(format!("无法启动 {} 的官方卸载程序：{error}", app.display_name));
-                                    self.enter(Phase::Error);
-                                }
-                            }
-                        } else {
-                            self.error = Some("无法重新解析该软件的可执行文件".to_owned());
-                            self.enter(Phase::Error);
-                        }
-                    } else {
-                        self.enter(Phase::Kick);
-                    }
+                    self.confirm_current_uninstall_candidate();
                 } else if choices[1].contains(x, y) {
-                    self.enter(Phase::Kick);
+                    self.delete_current_uninstall_source();
+                }
+            }
+            Phase::UninstallModeAsk => {
+                let choices = self.choice_rects();
+                if choices[0].contains(x, y) {
+                    // Delete non-uninstall targets once, then let the user
+                    // place a crosshair for every detected application.
+                    self.begin_manual_uninstall_selection();
+                } else if choices[1].contains(x, y) {
+                    // The explicit "all" choice is the only non-manual bulk
+                    // path.  It still launches BCU once with deduplicated app
+                    // ids and never touches resolved executable paths.
+                    self.confirmed_uninstall_candidates = self.uninstall_candidates.clone();
+                    self.queue_ordinary_targets();
+                    let shortcut_sources: Vec<PathBuf> = self
+                        .uninstall_candidates
+                        .iter()
+                        .filter(|candidate| is_shortcut_file(&candidate.source))
+                        .map(|candidate| candidate.source.clone())
+                        .collect();
+                    for source in shortcut_sources {
+                        self.queue_delete_path(source);
+                    }
+                    self.finish_uninstall_selection();
                 }
             }
             Phase::UninstallUnavailable => {
                 let choices = self.choice_rects();
                 if choices[0].contains(x, y) {
-                    self.enter(Phase::Kick);
+                    self.begin_direct_batch_recycle();
                 } else if choices[1].contains(x, y) {
                     unsafe {
                         let _ = DestroyWindow(self.hwnd);
@@ -586,7 +658,7 @@ impl OverlayApp {
                 })
                 .contains(x, y)
                 {
-                    match request_elevation(&self.target) {
+                    match request_elevation(&self.delete_targets) {
                         Ok(()) => unsafe {
                             let _ = DestroyWindow(self.hwnd);
                         },
@@ -671,26 +743,49 @@ impl OverlayApp {
             }
             Phase::Point if self.elapsed() >= 0.5 => {
                 self.ensure_kick_sequence();
-                self.enter(Phase::Ask);
+                if self.current_uninstall_candidate < self.uninstall_candidates.len()
+                    && !self.uninstall_markers.is_empty()
+                {
+                    self.enter(Phase::UninstallAsk);
+                } else {
+                    self.enter(Phase::Ask);
+                }
             }
             Phase::DetectUninstall => {
                 let result = self.uninstall_probe.as_ref().and_then(|receiver| match receiver.try_recv() {
                     Ok(result) => Some(result),
                     Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(BcuProbe::NotExecutableShortcut),
+                    Err(TryRecvError::Disconnected) => Some(Vec::new()),
                 });
                 if let Some(result) = result {
                     self.uninstall_probe = None;
-                    self.uninstall_candidate = None;
-                    match result {
-                        BcuProbe::Candidate(candidate) => {
-                            self.uninstall_candidate = Some(candidate);
-                            self.enter(Phase::UninstallAsk);
-                        }
-                        // The shortcut does launch an executable, but Windows
-                        // has no safe official uninstaller association for it.
-                        BcuProbe::ExecutableWithoutUninstaller => self.enter(Phase::UninstallUnavailable),
-                        BcuProbe::NotExecutableShortcut => self.enter(Phase::Kick),
+                    self.uninstall_candidates = result
+                        .into_iter()
+                        .filter_map(|(source, probe)| match probe {
+                            BcuProbe::Candidate(mut candidate) => {
+                                candidate.source = source;
+                                Some(candidate)
+                            }
+                            BcuProbe::ExecutableWithoutUninstaller
+                            | BcuProbe::NotExecutableShortcut => None,
+                        })
+                        .collect();
+                    self.current_uninstall_candidate = 0;
+                    self.confirmed_uninstall_candidates.clear();
+                    self.uninstall_markers.clear();
+                    if self.uninstall_candidates.is_empty() {
+                        // A batch that has no verified uninstall association
+                        // is just a normal batch deletion: never show a
+                        // spurious second question for text files/folders.
+                        self.begin_direct_batch_recycle();
+                    } else if self.uninstall_candidates.len() == 1 {
+                        // The initial target click already provides the
+                        // location for a one-item operation.  Requiring a
+                        // second crosshair here made the completed probe look
+                        // like a stalled overlay.
+                        self.begin_single_uninstall_flow();
+                    } else {
+                        self.enter(Phase::UninstallModeAsk);
                     }
                 }
             }
@@ -702,7 +797,11 @@ impl OverlayApp {
                     self.enter(Phase::Leo);
                 }
             }
-            Phase::Leo if self.elapsed() >= 15.0 / FRAME_RATE => self.enter(Phase::Fly),
+            Phase::Leo if self.elapsed() >= 15.0 / FRAME_RATE => match self.after_kick {
+                AfterKick::FlyAway => self.enter(Phase::Fly),
+                AfterKick::AskSingleUninstall => self.enter(Phase::UninstallAsk),
+                AfterKick::SelectUninstallTarget => self.enter_uninstall_target_selection(),
+            },
             Phase::Fly if self.elapsed() >= 2.0 => unsafe {
                 let _ = DestroyWindow(self.hwnd);
             },
@@ -711,40 +810,181 @@ impl OverlayApp {
         self.render();
     }
     fn begin_uninstall_probe(&mut self) -> bool {
-        let target = self.target.clone();
-        if !uninstall_target_matches_config(&target) {
+        let is_multi_target = self.targets.len() > 1;
+        let probe_targets: Vec<(PathBuf, PathBuf)> = self
+            .targets
+            .iter()
+            .filter(|target| {
+                if is_multi_target {
+                    batch_uninstall_target_matches_config(target)
+                } else {
+                    uninstall_target_matches_config(target)
+                }
+            })
+            .filter_map(|target| uninstall_probe_target(target).map(|executable| (target.clone(), executable)))
+            .collect();
+        if probe_targets.is_empty() {
             return false;
         }
-        let Some(probe_target) = uninstall_probe_target(&target) else {
-            return false;
-        };
         let bridge = bcu_bridge_path();
-        // The overlay must never enter uninstall detection for folders, normal
-        // files, or a missing bridge. `probe_target` is always a verified exe,
-        // while `target` remains the original file selected for deletion.
+        // The overlay never probes folders/normal files.  Every tuple keeps
+        // the original selected source next to its verified executable.
         if !bridge.is_file() {
             return false;
         }
         let index = uninstall_index_path();
         let (sender, receiver) = sync_channel(1);
         thread::spawn(move || {
-            let _ = sender.send(probe_bcu_executable(&bridge, &probe_target, &index));
+            let result = probe_targets
+                .into_iter()
+                .map(|(source, executable)| {
+                    let probe = probe_bcu_executable(&bridge, &executable, &index);
+                    (source, probe)
+                })
+                .collect();
+            let _ = sender.send(result);
         });
         self.uninstall_probe = Some(receiver);
         true
     }
+    fn queue_delete_path(&mut self, path: PathBuf) {
+        if !self.delete_targets.iter().any(|existing| existing == &path) {
+            self.delete_targets.push(path);
+        }
+    }
+    fn queue_delete_paths(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
+            self.queue_delete_path(path);
+        }
+    }
+    /// A multi-selection with no verified uninstall candidate is one ordinary
+    /// recycle operation over every originally selected path.  In particular,
+    /// no resolved shortcut target is substituted into this list.
+    fn begin_direct_batch_recycle(&mut self) {
+        self.queue_delete_paths(self.targets.clone());
+        self.start_delete_sequence(AfterKick::FlyAway);
+    }
+    fn start_delete_sequence(&mut self, after_kick: AfterKick) {
+        self.after_kick = after_kick;
+        self.deletion_started = false;
+        self.explosion_started = None;
+        self.ensure_kick_sequence();
+        self.enter(Phase::Kick);
+    }
+    fn begin_manual_uninstall_selection(&mut self) {
+        self.queue_ordinary_targets();
+        if self.delete_targets.is_empty() {
+            self.enter_uninstall_target_selection();
+        } else {
+            self.start_delete_sequence(AfterKick::SelectUninstallTarget);
+        }
+    }
+    fn begin_single_uninstall_flow(&mut self) {
+        self.queue_ordinary_targets();
+        if self.delete_targets.is_empty() {
+            self.enter(Phase::UninstallAsk);
+        } else {
+            self.start_delete_sequence(AfterKick::AskSingleUninstall);
+        }
+    }
+    fn queue_ordinary_targets(&mut self) {
+        let candidate_sources: std::collections::HashSet<PathBuf> = self
+            .uninstall_candidates
+            .iter()
+            .map(|candidate| candidate.source.clone())
+            .collect();
+        let ordinary_targets = self
+            .targets
+            .iter()
+            .filter(|target| !candidate_sources.contains(*target))
+            .cloned()
+            .collect();
+        self.queue_delete_paths(ordinary_targets);
+    }
+    fn enter_uninstall_target_selection(&mut self) {
+        self.current_uninstall_candidate = self.current_uninstall_candidate.min(self.uninstall_candidates.len());
+        self.enter(Phase::SelectUninstallTarget);
+    }
+    fn confirm_current_uninstall_candidate(&mut self) {
+        if let Some(candidate) = self.uninstall_candidates.get(self.current_uninstall_candidate).cloned() {
+            // The application uninstaller owns an `.exe`; a selected shortcut
+            // is still recycled afterwards so it cannot become stale.
+            if is_shortcut_file(&candidate.source) {
+                self.queue_delete_path(candidate.source.clone());
+            }
+            self.confirmed_uninstall_candidates.push(candidate);
+        }
+        self.advance_uninstall_selection();
+    }
+    fn delete_current_uninstall_source(&mut self) {
+        if let Some(candidate) = self.uninstall_candidates.get(self.current_uninstall_candidate) {
+            self.queue_delete_path(candidate.source.clone());
+        }
+        self.advance_uninstall_selection();
+    }
+    fn advance_uninstall_selection(&mut self) {
+        self.current_uninstall_candidate += 1;
+        if self.current_uninstall_candidate < self.uninstall_candidates.len() {
+            self.enter_uninstall_target_selection();
+        } else {
+            self.finish_uninstall_selection();
+        }
+    }
+    fn finish_uninstall_selection(&mut self) {
+        if !self.confirmed_uninstall_candidates.is_empty() {
+            if let Err(error) = launch_bcu_uninstaller(
+                &self.confirmed_uninstall_candidates,
+                uninstall_silent_execution_enabled(),
+            ) {
+                self.error = Some(format!("无法启动软件的官方卸载程序：{error}"));
+                self.enter(Phase::Error);
+                return;
+            }
+        }
+        if self.delete_targets.is_empty() {
+            self.enter(Phase::Fly);
+        } else {
+            self.start_delete_sequence(AfterKick::FlyAway);
+        }
+    }
     fn trigger_delete(&mut self) {
         self.deletion_started = true;
         self.explosion_started = Some(Instant::now());
+        self.explosion_positions = self.explosion_positions_for_delete();
         self.audio.play("monster_boom");
-        if let Err(error) = recycle(&self.target, false) {
-            if error.code() == ERROR_ACCESS_DENIED.into() {
+        match recycle(&self.delete_targets, false) {
+            Ok(()) => self.delete_targets.clear(),
+            Err(error) if error.code() == ERROR_ACCESS_DENIED.into() => {
                 self.enter(Phase::Elevate);
-            } else {
+            }
+            Err(error) => {
                 self.error = Some(format!("删除失败：{error}"));
                 self.enter(Phase::Error);
             }
         }
+    }
+    fn explosion_positions_for_delete(&self) -> Vec<(i32, i32)> {
+        if !self.uninstall_markers.is_empty() {
+            return self.uninstall_markers.clone();
+        }
+        // Explorer does not expose icon coordinates in a shell-verb command.
+        // Keep separate explosion instances instead of spawning overlays; fan
+        // them around the user-selected point for multi-item operations.
+        let count = self.delete_targets.len().max(1);
+        (0..count)
+            .map(|index| {
+                if count == 1 {
+                    self.target_position
+                } else {
+                    let angle = std::f32::consts::TAU * index as f32 / count as f32;
+                    let radius = self.px(42 + ((index % 3) as i32 * 18)) as f32;
+                    (
+                        self.target_position.0 + (angle.cos() * radius) as i32,
+                        self.target_position.1 + (angle.sin() * radius) as i32,
+                    )
+                }
+            })
+            .collect()
     }
     fn clear(&mut self) {
         self.pixels.fill(0);
@@ -994,8 +1234,23 @@ impl OverlayApp {
             );
         }
         let content_alpha = ((opacity / 0.35).min(1.0) * 255.0) as u8;
+        let prompt = if self.phase == Phase::SelectUninstallTarget {
+            self.uninstall_candidates
+                .get(self.current_uninstall_candidate)
+                .map(|candidate| {
+                    format!(
+                        "请用准星标记要卸载的：{}（{}/{}）",
+                        candidate.display_name,
+                        self.current_uninstall_candidate + 1,
+                        self.uninstall_candidates.len()
+                    )
+                })
+                .unwrap_or_else(|| "请选择要卸载的软件目标".to_owned())
+        } else {
+            "请选择你要摧毁的文件".to_owned()
+        };
         self.text(
-            "请选择你要摧毁的文件",
+            &prompt,
             RectI {
                 x: self.width / 2 - 300,
                 y: self.height / 2 - 28,
@@ -1005,6 +1260,36 @@ impl OverlayApp {
             30,
             (255, 255, 255, content_alpha),
         );
+    }
+    fn draw_uninstall_markers(&mut self) {
+        let markers = self.uninstall_markers.clone();
+        let newest = markers.len().saturating_sub(1);
+        for (index, &(x, y)) in markers.iter().enumerate() {
+            // The newly selected point grows in over the pointing animation,
+            // then remains fixed while the user answers its uninstall prompt
+            // and selects the remaining targets.
+            let scale = if index == newest && self.phase == Phase::Point {
+                (self.elapsed() / 0.20).clamp(0.15, 1.0)
+            } else {
+                1.0
+            };
+            let arm = (self.px(15) as f32 * scale).round().max(2.0) as i32;
+            let stroke = (self.px(3) as f32 * scale).round().max(1.0) as i32;
+            let alpha = (235.0 * scale) as u8;
+            // A translucent mask plus a fixed red X makes each manually
+            // assigned uninstall target visible while more are selected.
+            self.rect(
+                RectI { x: x - arm - stroke, y: y - arm - stroke, w: (arm + stroke) * 2, h: (arm + stroke) * 2 },
+                (225, 45, 45, (52.0 * scale) as u8),
+                self.px(18),
+            );
+            for offset in -stroke..=stroke {
+                for step in -arm..=arm {
+                    self.blend(x + step, y + step + offset, 235, 45, 45, alpha);
+                    self.blend(x + step, y - step + offset, 235, 45, 45, alpha);
+                }
+            }
+        }
     }
     fn draw_bubble_size(
         &mut self,
@@ -1137,6 +1422,7 @@ impl OverlayApp {
         self.clear();
         match self.phase {
             Phase::Select => self.draw_selection((self.elapsed() / 0.8).min(1.0) * 0.35),
+            Phase::SelectUninstallTarget => self.draw_selection(0.35),
             Phase::FadeOut => self.draw_selection((1.0 - self.elapsed() / 0.5).max(0.0) * 0.35),
             Phase::Walk => {
                 if let Some(sprite) = self.walk.as_ref() {
@@ -1180,7 +1466,11 @@ impl OverlayApp {
                     );
                 }
             }
-            Phase::Ask | Phase::DetectUninstall | Phase::UninstallAsk | Phase::UninstallUnavailable => {
+            Phase::Ask
+            | Phase::DetectUninstall
+            | Phase::UninstallModeAsk
+            | Phase::UninstallAsk
+            | Phase::UninstallUnavailable => {
                 if let Some(sprite) = self.point.as_ref() {
                     let position = self.monster_position(sprite);
                     let (w, h) = (sprite.width, sprite.height);
@@ -1196,7 +1486,9 @@ impl OverlayApp {
                         255,
                         self.points_left,
                     );
-                    let (message, first_choice, second_choice) = if self.phase == Phase::UninstallAsk {
+                    let (message, first_choice, second_choice) = if self.phase == Phase::UninstallModeAsk {
+                        ("检测到多个可卸载软件，\n要怎么处理？", "逐一指定", "全部卸载")
+                    } else if self.phase == Phase::UninstallAsk {
                         if uninstall_silent_execution_enabled() {
                             ("居然是软件，\n要悄悄卸载吗？", "静默卸载", "就删除快捷方式好啦")
                         } else {
@@ -1206,6 +1498,8 @@ impl OverlayApp {
                         ("让我查查这是什么……", "", "")
                     } else if self.phase == Phase::UninstallUnavailable {
                         ("这个软件只能删除，\n无法卸载", "只删除", "取消")
+                    } else if self.targets.len() > 1 {
+                        ("喂，是这些吗？", "是的", "嘤嘤嘤就是这些")
                     } else {
                         ("喂，是这个吗？", "是的", "嘤嘤嘤就是这个")
                     };
@@ -1274,6 +1568,14 @@ impl OverlayApp {
             Phase::Elevate => self.draw_modal(false),
             Phase::Error => self.draw_modal(true),
         }
+        if !self.uninstall_markers.is_empty()
+            && matches!(
+                self.phase,
+                Phase::SelectUninstallTarget | Phase::Point | Phase::UninstallAsk
+            )
+        {
+            self.draw_uninstall_markers();
+        }
         unsafe {
             let target = slice::from_raw_parts_mut(self.surface.bits, self.pixels.len());
             target.copy_from_slice(&self.pixels);
@@ -1311,17 +1613,20 @@ impl OverlayApp {
             if elapsed <= 15.0 / FRAME_RATE {
                 let image =
                     sprite.frames[(elapsed * FRAME_RATE) as usize % sprite.frames.len()].clone();
-                self.image(
-                    &image,
-                    RectI {
-                        x: self.target_position.0 - sprite.width / 2,
-                        y: self.target_position.1 - sprite.height / 2 - 40,
-                        w: sprite.width,
-                        h: sprite.height,
-                    },
-                    255,
-                    false,
-                );
+                let (width, height) = (sprite.width, sprite.height);
+                for &(x, y) in &self.explosion_positions.clone() {
+                    self.image(
+                        &image,
+                        RectI {
+                            x: x - width / 2,
+                            y: y - height / 2 - 40,
+                            w: width,
+                            h: height,
+                        },
+                        255,
+                        false,
+                    );
+                }
             }
         }
     }
@@ -1361,7 +1666,7 @@ unsafe extern "system" fn window_proc(
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_SETCURSOR if matches!(app.phase, Phase::Select) => {
+        WM_SETCURSOR if matches!(app.phase, Phase::Select | Phase::SelectUninstallTarget) => {
             let _ = SetCursor(Some(app.target_cursor));
             LRESULT(1)
         }
@@ -1377,7 +1682,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn run_overlay(target: PathBuf) -> Result<()> {
+fn run_overlay(targets: Vec<PathBuf>) -> Result<()> {
     unsafe {
         // Keep the bitmap, cursor events, and virtual-screen metrics in the
         // same physical-pixel coordinate space on mixed-DPI displays.
@@ -1391,7 +1696,7 @@ fn run_overlay(target: PathBuf) -> Result<()> {
         };
         let _ = RegisterClassW(&window_class);
         let app = Box::into_raw(Box::new(
-            OverlayApp::new(target).ok_or_else(windows::core::Error::from_thread)?,
+            OverlayApp::new(targets).ok_or_else(windows::core::Error::from_thread)?,
         ));
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -1456,14 +1761,25 @@ fn recycle_failure_code(status: i32, aborted: bool) -> Option<WIN32_ERROR> {
     })
 }
 
-fn recycle(target: &Path, elevated: bool) -> Result<()> {
-    let target_wide = wide(target.as_os_str());
-    unsafe {
-        if GetFileAttributesW(PCWSTR(target_wide.as_ptr())) == u32::MAX {
-            return Err(windows::core::Error::from_thread());
+fn recycle(targets: &[PathBuf], elevated: bool) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    // SHFileOperation accepts a double-NUL-terminated sequence of paths.  One
+    // operation gives a selected batch one recycle action instead of starting
+    // one overlay/process per Explorer item.
+    let mut from = Vec::new();
+    for target in targets {
+        let target_wide = wide(target.as_os_str());
+        unsafe {
+            if GetFileAttributesW(PCWSTR(target_wide.as_ptr())) == u32::MAX {
+                return Err(windows::core::Error::from_thread());
+            }
         }
-        let mut from = target_wide;
-        from.push(0);
+        from.extend_from_slice(&target_wide);
+    }
+    from.push(0);
+    unsafe {
         let mut operation = SHFILEOPSTRUCTW {
             wFunc: FO_DELETE,
             pFrom: PCWSTR(from.as_ptr()),
@@ -1488,9 +1804,15 @@ fn recycle(target: &Path, elevated: bool) -> Result<()> {
     Ok(())
 }
 
-fn request_elevation(target: &Path) -> Result<()> {
+fn request_elevation(targets: &[PathBuf]) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
     let exe = env::current_exe().map_err(|_| windows::core::Error::from_thread())?;
-    let parameters = format!("--elevated-delete \"{}\"", target.display());
+    let parameters = std::iter::once("--elevated-delete".to_owned())
+        .chain(targets.iter().map(|target| format!("\"{}\"", target.display())))
+        .collect::<Vec<_>>()
+        .join(" ");
     unsafe {
         let result = ShellExecuteW(
             Some(HWND::default()),
@@ -1801,13 +2123,33 @@ fn probe_bcu_executable(bridge: &Path, executable: &Path, index: &Path) -> BcuPr
     if !bridge.is_file() || !executable.is_file() || !is_executable_file(executable) {
         return BcuProbe::NotExecutableShortcut;
     }
-    let Ok(output) = Command::new(bridge)
+    let Ok(mut child) = Command::new(bridge)
         .arg("resolve")
         .arg(executable)
         .arg(index)
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     else {
+        return BcuProbe::NotExecutableShortcut;
+    };
+    // Registry/MSI enumeration can be slow, but an interactive overlay must
+    // never spin forever if a third-party uninstall entry blocks the bridge.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return BcuProbe::NotExecutableShortcut;
+            }
+            Err(_) => return BcuProbe::NotExecutableShortcut,
+        }
+    }
+    let Ok(output) = child.wait_with_output() else {
         return BcuProbe::NotExecutableShortcut;
     };
     if !output.status.success() {
@@ -1833,6 +2175,8 @@ fn probe_bcu_executable(bridge: &Path, executable: &Path, index: &Path) -> BcuPr
                 return BcuProbe::NotExecutableShortcut;
             };
             BcuProbe::Candidate(BcuCandidate {
+                source: PathBuf::new(),
+                executable: executable.to_path_buf(),
                 id: id.to_owned(),
                 display_name,
             })
@@ -1860,19 +2204,20 @@ fn uninstall_probe_target(target: &Path) -> Option<PathBuf> {
     (executable.is_file() && is_executable_file(&executable)).then_some(executable)
 }
 
-fn launch_bcu_uninstaller(executable: &Path, candidate_id: &str, quiet: bool) -> Result<()> {
+fn launch_bcu_uninstaller(candidates: &[BcuCandidate], quiet: bool) -> Result<()> {
     let bridge = bcu_bridge_path();
-    if !bridge.is_file() {
+    if !bridge.is_file() || candidates.is_empty() {
         return Err(windows::core::Error::from_thread());
     }
     let mut command = Command::new(bridge);
     command
-        .arg("uninstall")
-        .arg(executable)
-        .arg(candidate_id)
+        .arg("uninstall-batch")
         .creation_flags(CREATE_NO_WINDOW);
     if quiet {
         command.arg("--quiet");
+    }
+    for candidate in candidates {
+        command.arg(&candidate.executable).arg(&candidate.id);
     }
     command.spawn().map_err(|_| windows::core::Error::from_thread())?;
     Ok(())
@@ -1969,6 +2314,7 @@ fn write_uninstall_config(config: &UninstallConfig) -> std::io::Result<()> {
             "enabled": config.enabled,
             "mode": config.mode,
             "target_patterns": config.target_patterns,
+            "batch_target_patterns": config.batch_target_patterns,
             "cleanup_after_uninstall": false,
         }
     });
@@ -1994,6 +2340,13 @@ fn read_uninstall_config() -> UninstallConfig {
                     .to_owned();
                 if let Some(patterns) = uninstall.get("target_patterns").and_then(Value::as_array) {
                     config.target_patterns = patterns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                }
+                if let Some(patterns) = uninstall.get("batch_target_patterns").and_then(Value::as_array) {
+                    config.batch_target_patterns = patterns
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
@@ -2026,6 +2379,13 @@ fn uninstall_target_matches_config(path: &Path) -> bool {
         return false;
     };
     matches_uninstall_patterns(name, &read_uninstall_config().target_patterns)
+}
+
+fn batch_uninstall_target_matches_config(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches_uninstall_patterns(name, &read_uninstall_config().batch_target_patterns)
 }
 
 fn matches_uninstall_patterns(name: &str, patterns: &[String]) -> bool {
@@ -2079,10 +2439,144 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
+fn receive_selection(bytes: &[u8]) -> Vec<PathBuf> {
+    // A selection path list is normally a few kilobytes.  Bound this local
+    // IPC input so an unrelated local process cannot make the overlay allocate
+    // an arbitrary amount of memory.
+    if bytes.is_empty() || bytes.len() > SELECTION_BROKER_MAX_PACKET {
+        return Vec::new();
+    }
+    if bytes.len() % 2 != 0 {
+        return Vec::new();
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    units
+        .split(|unit| *unit == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| String::from_utf16(path).ok())
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect()
+}
+
+struct SelectionBrokerMutex(HANDLE);
+
+impl Drop for SelectionBrokerMutex {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Only the process which creates this mutex can ever launch an animation.
+/// A second broker instance exits before it can open an overlay.
+fn acquire_selection_broker_mutex() -> Result<Option<SelectionBrokerMutex>> {
+    unsafe {
+        let name = wide(SELECTION_BROKER_MUTEX);
+        // Do not infer ownership from GetLastError: it is thread-local and a
+        // stale value can report ERROR_ALREADY_EXISTS for a newly created
+        // mutex.  A zero-time wait gives an unambiguous ownership result.
+        let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))?;
+        let wait = WaitForSingleObject(handle, 0);
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            let _ = CloseHandle(handle);
+            return Ok(None);
+        }
+        Ok(Some(SelectionBrokerMutex(handle)))
+    }
+}
+
+/// Count the complete group of target messages before any overlay is created.
+/// This is deliberately a broker-only operation: the normal animation process
+/// never races a sibling Explorer invocation.
+fn receive_selection_batch(socket: &UdpSocket) -> Vec<PathBuf> {
+    let started = Instant::now();
+    let mut first_received = None;
+    let mut collected = Vec::new();
+    loop {
+        let mut packet = [0_u8; SELECTION_BROKER_MAX_PACKET];
+        match socket.recv_from(&mut packet) {
+            Ok((length, source)) => {
+                // Acknowledge every datagram.  The bootstrap only exits after
+                // receiving this reply, so a packet sent before the broker is
+                // ready cannot silently lose a selected target.
+                let _ = socket.send_to(&[1_u8], source);
+                let received = receive_selection(&packet[..length]);
+                if !received.is_empty() {
+                    collected.extend(received);
+                    first_received.get_or_insert_with(Instant::now);
+                }
+            }
+            // Windows can report ConnectionReset on the next UDP receive when
+            // a short-lived bootstrap has already closed its reply socket.
+            // It does not mean that the broker or its bound endpoint failed.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset
+                ) => {
+                let now = Instant::now();
+                let collection_complete = first_received.is_some_and(|first| {
+                    now.duration_since(first) >= SELECTION_BROKER_COLLECTION_WINDOW
+                });
+                if collection_complete || now.duration_since(started) >= SELECTION_BROKER_MAX_WAIT {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    collected.sort();
+    collected.dedup();
+    collected
+}
+
+/// The broker holds the exclusive mutex for the entire selection transaction.
+/// It receives paths from the tiny Explorer entry program, counts and dedupes
+/// them, then launches exactly one animation child process.
+fn run_selection_broker() -> Result<()> {
+    let Some(_mutex) = acquire_selection_broker_mutex()? else {
+        return Ok(());
+    };
+    // Datagram IPC avoids TCP's TIME_WAIT state.  The previous stream listener
+    // could be unavailable for a while after an overlay closed, leaving the
+    // Explorer entry point spinning even though no broker was running.
+    let socket = UdpSocket::bind(SELECTION_BROKER_ADDR)
+        .map_err(|_| windows::core::Error::from_thread())?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|_| windows::core::Error::from_thread())?;
+    let targets = receive_selection_batch(&socket);
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|_| windows::core::Error::from_thread())?;
+    let mut child = Command::new(exe)
+        .arg("--run-selection")
+        .args(targets)
+        .spawn()
+        .map_err(|_| windows::core::Error::from_thread())?;
+    let _ = child.wait();
+    Ok(())
+}
+
 fn main() {
     let mut args = env::args_os();
     let _ = args.next();
     let first_arg = args.next();
+    if first_arg
+        .as_deref()
+        .is_some_and(|value| value == "--selection-broker")
+    {
+        let _ = run_selection_broker();
+        return;
+    }
     if first_arg.as_deref().is_some_and(|value| value == "--settings") {
         let _ = show_settings();
         return;
@@ -2091,13 +2585,25 @@ fn main() {
         .as_deref()
         .is_some_and(|value| value == "--elevated-delete")
     {
-        if let Some(target) = args.next().map(PathBuf::from) {
-            let _ = recycle(&target, true);
+        let targets: Vec<PathBuf> = args.map(PathBuf::from).collect();
+        if !targets.is_empty() {
+            let _ = recycle(&targets, true);
         }
         return;
     }
-    let target = env::args_os().nth(1).map(PathBuf::from).unwrap_or_default();
-    let _ = run_overlay(target);
+    let run_selection = first_arg
+        .as_deref()
+        .is_some_and(|value| value == "--run-selection");
+    let targets: Vec<PathBuf> = first_arg
+        .into_iter()
+        .filter(|_| !run_selection)
+        .chain(args)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+    if !targets.is_empty() {
+        let _ = run_overlay(targets);
+    }
 }
 
 #[cfg(test)]

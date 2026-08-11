@@ -112,12 +112,13 @@ dependencies = [
 
 [[package]]
 name = "monster-deleter"
-version = "1.0.17"
+version = "1.1.0"
 dependencies = [
  "image",
  "regex",
  "serde_json",
  "windows",
+ "windows-core",
  "winres",
 ]
 
